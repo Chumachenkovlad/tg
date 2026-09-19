@@ -1,10 +1,32 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { FileSessionStore } from "../src/telegram/session-store.js";
-import { SessionReadError } from "../src/telegram/types.js";
+import { SessionReadError, SessionWriteError } from "../src/telegram/types.js";
+
+/** Forces the temporary file somewhere unusable, to exercise the failure path. */
+class FailingWriteStore extends FileSessionStore {
+  constructor(
+    path: string,
+    private readonly temporary: string,
+  ) {
+    super(path, { ownsDirectory: true });
+  }
+
+  protected override temporaryPath(): string {
+    return this.temporary;
+  }
+}
 
 const mode = (path: string): number => statSync(path).mode & 0o777;
 
@@ -139,6 +161,113 @@ describe("FileSessionStore", () => {
           assert.ok(error instanceof SessionReadError);
           assert.match(error.message, /Cannot read the session file/);
           assert.match(error.message, /EISDIR/);
+          return true;
+        },
+      );
+    });
+  });
+
+  describe("atomic writes", () => {
+    it("replaces an existing session by rename, not in place", () => {
+      const store = new FileSessionStore(sessionPath, { ownsDirectory: true });
+      store.save("FIRST_SESSION");
+      chmodSync(sessionPath, 0o644);
+      const before = statSync(sessionPath).ino;
+
+      store.save("SECOND_SESSION");
+
+      assert.equal(store.load(), "SECOND_SESSION");
+      assert.notEqual(
+        statSync(sessionPath).ino,
+        before,
+        "an atomic replacement swaps the file, it does not truncate it in place",
+      );
+      assert.equal(mode(sessionPath), 0o600, "the replacement must not inherit 0644");
+    });
+
+    it("leaves no temporary files behind", () => {
+      const store = new FileSessionStore(sessionPath, { ownsDirectory: true });
+      store.save("FIRST_SESSION");
+      store.save("SECOND_SESSION");
+
+      assert.deepEqual(readdirSync(dirname(sessionPath)), ["session"]);
+    });
+
+    it("keeps the original session when the write fails", () => {
+      const store = new FileSessionStore(sessionPath, { ownsDirectory: true });
+      store.save("ORIGINAL_SESSION");
+      const original = statSync(sessionPath).ino;
+
+      // Temporary file in a directory that does not exist: the write fails
+      // before anything can touch the destination.
+      const failing = new FailingWriteStore(sessionPath, join(root, "missing", "tmp"));
+
+      assert.throws(
+        () => failing.save("REPLACEMENT_SESSION"),
+        (error: unknown) => {
+          assert.ok(error instanceof SessionWriteError);
+          assert.match(error.message, /left unchanged/);
+          return true;
+        },
+      );
+
+      assert.equal(store.load(), "ORIGINAL_SESSION", "the stored session must survive");
+      assert.equal(statSync(sessionPath).ino, original);
+      assert.equal(mode(sessionPath), 0o600);
+      assert.deepEqual(readdirSync(dirname(sessionPath)), ["session"]);
+    });
+
+    it("removes the temporary file when the rename fails", () => {
+      const store = new FileSessionStore(sessionPath, { ownsDirectory: true });
+      store.save("ORIGINAL_SESSION");
+
+      // A directory at the destination makes rename() fail after a successful
+      // temporary write, which is exactly the cleanup path under test.
+      const blocked = join(root, "app-dir", "blocked");
+      mkdirSync(blocked, { recursive: true });
+      const blockedStore = new FileSessionStore(blocked, { ownsDirectory: true });
+
+      assert.throws(() => blockedStore.save("VALUE"), SessionWriteError);
+
+      const leftovers = readdirSync(dirname(sessionPath)).filter((name) => name.endsWith(".tmp"));
+      assert.deepEqual(leftovers, [], "no temporary file may be left behind");
+    });
+  });
+
+  describe("ensureWritable", () => {
+    it("passes for a usable location and creates the directory", () => {
+      const store = new FileSessionStore(sessionPath, { ownsDirectory: true });
+
+      store.ensureWritable();
+
+      assert.equal(mode(dirname(sessionPath)), 0o700);
+      assert.deepEqual(readdirSync(dirname(sessionPath)), [], "the probe must be cleaned up");
+    });
+
+    it("does not touch an existing session", () => {
+      const store = new FileSessionStore(sessionPath, { ownsDirectory: true });
+      store.save("EXISTING_SESSION");
+      const before = statSync(sessionPath).ino;
+
+      store.ensureWritable();
+
+      assert.equal(store.load(), "EXISTING_SESSION");
+      assert.equal(statSync(sessionPath).ino, before);
+      assert.deepEqual(readdirSync(dirname(sessionPath)), ["session"]);
+    });
+
+    it("fails when the location cannot hold a session file", () => {
+      // The parent of the session file is a regular file, so no directory can
+      // be created there.
+      const blockedParent = join(root, "not-a-directory");
+      writeFileSync(blockedParent, "x");
+      const store = new FileSessionStore(join(blockedParent, "session"), { ownsDirectory: true });
+
+      assert.throws(
+        () => store.ensureWritable(),
+        (error: unknown) => {
+          assert.ok(error instanceof SessionWriteError);
+          assert.match(error.message, /Cannot (create the session directory|write the session)/);
           return true;
         },
       );

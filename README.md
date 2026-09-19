@@ -64,6 +64,13 @@ created with `700`.
 - The session file is always forced to `600` — on write and on read, so a file left
   permissive earlier is tightened. `mode` alone is not enough: it only applies when
   the file is created.
+- Writes are atomic: the session goes to a temporary `600` file in the same directory
+  and is renamed over the destination only after the write succeeds. A failed or
+  interrupted write leaves the previous session intact and removes the temporary file.
+- Before a fresh authorization the storage location is probed (a throwaway file next
+  to the session, never the session itself). If the session could not be saved, the
+  login is not attempted at all — otherwise the account would end up with an
+  authorized device whose session was lost.
 - A **missing** session simply starts a login. A session that is **read but does not
   parse** is discarded with a warning and a login starts. A session that **cannot be
   read** (permissions, I/O) is a hard error: the CLI stops instead of quietly
@@ -84,7 +91,8 @@ Do not commit or share it. To revoke it, terminate the session in Telegram →
 | `npm test` | Node's built-in test runner (`test/*.test.ts`) |
 
 Tests cover session file and directory permissions (including that a directory the
-app does not own is left alone), the malformed-session fallback, read failures being
-fatal, and configuration validation. They never open a network connection and need no
-credentials. CI runs `npm ci`, `npm run typecheck` and `npm test` on pushes and pull
+app does not own is left alone), atomic replacement and survival of a failed write,
+the preflight that stops a login when the session could not be stored, the
+malformed-session fallback, read failures being fatal, and configuration validation.
+They never open a network connection and need no credentials. CI runs `npm ci`, `npm run typecheck` and `npm test` on pushes and pull
 requests.

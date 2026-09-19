@@ -3,8 +3,8 @@ import { describe, it } from "node:test";
 import { AuthKey } from "teleproto/crypto/AuthKey.js";
 import { StringSession } from "teleproto/sessions/index.js";
 import { TelegramAccountClient } from "../src/telegram/client.js";
-import { SessionReadError } from "../src/telegram/types.js";
-import type { SessionStore, TelegramConfig } from "../src/telegram/types.js";
+import { SessionReadError, SessionWriteError } from "../src/telegram/types.js";
+import type { AuthPrompts, SessionStore, TelegramConfig } from "../src/telegram/types.js";
 
 const CONFIG: TelegramConfig = {
   apiId: 12345,
@@ -31,6 +31,8 @@ async function serializableSession(): Promise<string> {
 /** In-memory store so these tests never touch the filesystem or the network. */
 class FakeStore implements SessionStore {
   saved: string | undefined;
+  writableChecked = false;
+  writableError: Error | undefined;
 
   constructor(
     private readonly value: string | (() => never),
@@ -39,6 +41,11 @@ class FakeStore implements SessionStore {
 
   load(): string {
     return typeof this.value === "function" ? this.value() : this.value;
+  }
+
+  ensureWritable(): void {
+    this.writableChecked = true;
+    if (this.writableError) throw this.writableError;
   }
 
   save(session: string): void {
@@ -165,5 +172,61 @@ describe("TelegramAccountClient session restore", () => {
     );
 
     assert.equal(client.sessionLocation, "~/.tg-8042/session");
+  });
+});
+
+describe("TelegramAccountClient.signIn", () => {
+  /** Prompts that fail the test if the login flow ever reaches them. */
+  const forbiddenPrompts: AuthPrompts = {
+    phoneNumber: () => assert.fail("the login must not ask for a phone number"),
+    loginCode: () => assert.fail("the login must not ask for a code"),
+    password: () => assert.fail("the login must not ask for a password"),
+  };
+
+  /**
+   * Replaces the underlying MTProto `start` call so nothing touches the
+   * network, and records whether a login was attempted.
+   */
+  function stubStart(client: TelegramAccountClient): { started: () => boolean } {
+    let started = false;
+    const internals = client as unknown as { client: { start: () => Promise<void> } };
+    internals.client.start = async () => {
+      started = true;
+    };
+    return { started: () => started };
+  }
+
+  it("does not attempt a login when the session cannot be persisted", async () => {
+    const store = new FakeStore("");
+    store.writableError = new SessionWriteError("Cannot write the session to /tmp/x (EACCES).");
+    const client = TelegramAccountClient.fromConfig(CONFIG, store);
+    const login = stubStart(client);
+
+    await assert.rejects(() => client.signIn(forbiddenPrompts), SessionWriteError);
+
+    assert.equal(store.writableChecked, true, "the location must be checked first");
+    assert.equal(login.started(), false, "no authorization may be attempted");
+    assert.equal(store.saved, undefined);
+  });
+
+  it("checks the location before logging in, then stores the session", async () => {
+    const order: string[] = [];
+    const store = new FakeStore("");
+    const originalEnsure = store.ensureWritable.bind(store);
+    store.ensureWritable = () => {
+      order.push("ensureWritable");
+      originalEnsure();
+    };
+
+    const client = TelegramAccountClient.fromConfig(CONFIG, store);
+    const internals = client as unknown as { client: { start: () => Promise<void> } };
+    internals.client.start = async () => {
+      order.push("start");
+    };
+
+    await client.signIn(forbiddenPrompts);
+
+    assert.deepEqual(order, ["ensureWritable", "start"]);
+    assert.equal(typeof store.saved, "string", "the session must be persisted after the login");
   });
 });

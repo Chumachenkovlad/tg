@@ -39,6 +39,17 @@ export class SessionReadError extends Error {
   }
 }
 
+/**
+ * Raised when the session cannot be persisted, or when the location is not
+ * usable in the first place.
+ */
+export class SessionWriteError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "SessionWriteError";
+  }
+}
+
 /** Where the session credential is kept between runs. */
 export interface SessionStore {
   /**
@@ -46,6 +57,14 @@ export interface SessionStore {
    * Throws {@link SessionReadError} when a session exists but cannot be read.
    */
   load(): string;
+  /**
+   * Checks that a session could be written here, without touching one that is
+   * already stored. Called before a fresh authorization so a login is never
+   * completed only to find the result cannot be kept.
+   * Throws {@link SessionWriteError} when the location is not usable.
+   */
+  ensureWritable(): void;
+  /** Persists the session, replacing any previous one atomically. */
   save(session: string): void;
   /** Human-readable location, for log messages. */
   describe(): string;

@@ -81,8 +81,13 @@ export class TelegramAccountClient {
   /**
    * Runs the interactive login and persists the resulting session.
    * Only called when there is no valid session yet.
+   *
+   * The storage location is checked first: authorizing the account and only
+   * then discovering that the session cannot be saved would leave a live
+   * device registered on the account with nothing to reuse it.
    */
   async signIn(prompts: AuthPrompts): Promise<void> {
+    this.store.ensureWritable();
     await this.client.start({
       phoneNumber: () => prompts.phoneNumber(),
       phoneCode: () => prompts.loginCode(),
