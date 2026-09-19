@@ -234,11 +234,14 @@ describe("TelegramAccountClient.signIn", () => {
   });
 });
 
+/** A ref shaped exactly as the client builds one: raw ids, no TL object. */
+const FORUM = new ForumRef("2000000042", {
+  channelId: bigInt(2000000042),
+  accessHash: bigInt(99),
+});
+
 describe("TelegramAccountClient.sendMessageToTopic", () => {
-  const forum = new ForumRef(
-    "2000000042",
-    new Api.InputPeerChannel({ channelId: bigInt(2000000042), accessHash: bigInt(99) }),
-  );
+  const forum = FORUM;
 
   /**
    * Replaces the underlying `invoke` so the request can be inspected without
@@ -354,5 +357,147 @@ describe("TelegramAccountClient.createForumSupergroup", () => {
     assert.equal(request.title, "TSC 8042 Test");
     assert.equal(created.id, "2000000042");
     assert.ok(!String(created.ref).includes("99"), "the access hash must not be printable");
+  });
+});
+
+/**
+ * Every Telegram RPC this client sends, checked against the official TL
+ * parameter type.
+ *
+ * `InputPeerChannel` and `InputChannel` carry the same two fields but are
+ * different constructors on the wire, and the library types both parameters
+ * as the loose `TypeEntityLike` — so nothing but a test like this catches a
+ * `channels.*` method handed an InputPeer.
+ *
+ * TL schema, for reference:
+ *   channels.createChannel      (no peer parameter)
+ *   channels.getMessages        channel:InputChannel
+ *   channels.editTitle          channel:InputChannel
+ *   messages.createForumTopic   peer:InputPeer
+ *   messages.sendMessage        peer:InputPeer
+ *   messages.editMessage        peer:InputPeer
+ *   messages.editForumTopic     peer:InputPeer
+ *   messages.getForumTopicsByID peer:InputPeer
+ */
+describe("TL parameter types", () => {
+  /** Captures every request, answering each with something plausible. */
+  function recorder(client: TelegramAccountClient): { requests: Api.AnyRequest[] } {
+    const requests: Api.AnyRequest[] = [];
+    const internals = client as unknown as {
+      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+    };
+    internals.client.invoke = async (request) => {
+      requests.push(request);
+      if (request instanceof Api.messages.GetForumTopicsByID) {
+        return new Api.messages.ForumTopics({
+          count: 0,
+          topics: [],
+          messages: [],
+          chats: [],
+          users: [],
+          pts: 0,
+        });
+      }
+      if (request instanceof Api.channels.GetMessages) {
+        return new Api.messages.ChannelMessages({
+          pts: 0,
+          count: 0,
+          messages: [],
+          topics: [],
+          chats: [],
+          users: [],
+        });
+      }
+      return new Api.Updates({
+        updates: [new Api.UpdateMessageID({ id: 7, randomId: bigInt(1) })],
+        users: [],
+        chats: [],
+        date: 0,
+        seq: 0,
+      });
+    };
+    return { requests };
+  }
+
+  /** Runs every call that takes a forum reference, once. */
+  async function callEverything(): Promise<Api.AnyRequest[]> {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const recorded = recorder(client);
+
+    await client.createForumTopic(FORUM, "t");
+    await client.sendMessageToTopic(FORUM, 1, "m");
+    await client.setForumTitle(FORUM, "t");
+    await client.setTopicTitle(FORUM, 1, "t");
+    await client.setMessageText(FORUM, 1, "m");
+    await client.listExistingTopics(FORUM, [1]);
+    await client.listExistingMessages(FORUM, [1]);
+
+    return recorded.requests;
+  }
+
+  function find<T extends Api.AnyRequest>(
+    requests: Api.AnyRequest[],
+    kind: new (...args: never[]) => T,
+  ): T {
+    const found = requests.find((request): request is T => request instanceof kind);
+    assert.ok(found, `no ${kind.name} request was sent`);
+    return found;
+  }
+
+  it("gives every channels.* method an InputChannel", async () => {
+    const requests = await callEverything();
+
+    for (const [name, request] of [
+      ["channels.getMessages", find(requests, Api.channels.GetMessages).channel],
+      ["channels.editTitle", find(requests, Api.channels.EditTitle).channel],
+    ] as const) {
+      assert.ok(
+        request instanceof Api.InputChannel,
+        `${name} must take InputChannel, got ${(request as object).constructor.name}`,
+      );
+      assert.ok(
+        !(request instanceof Api.InputPeerChannel),
+        `${name} must not be handed an InputPeerChannel`,
+      );
+    }
+  });
+
+  it("gives every messages.* method an InputPeer", async () => {
+    const requests = await callEverything();
+
+    for (const [name, peer] of [
+      ["messages.createForumTopic", find(requests, Api.messages.CreateForumTopic).peer],
+      ["messages.sendMessage", find(requests, Api.messages.SendMessage).peer],
+      ["messages.editMessage", find(requests, Api.messages.EditMessage).peer],
+      ["messages.editForumTopic", find(requests, Api.messages.EditForumTopic).peer],
+      ["messages.getForumTopicsByID", find(requests, Api.messages.GetForumTopicsByID).peer],
+    ] as const) {
+      assert.ok(
+        peer instanceof Api.InputPeerChannel,
+        `${name} must take InputPeerChannel, got ${(peer as object).constructor.name}`,
+      );
+      assert.ok(!(peer instanceof Api.InputChannel), `${name} must not be handed an InputChannel`);
+    }
+  });
+
+  it("carries the same ids whichever wrapper is used", async () => {
+    const requests = await callEverything();
+
+    const channel = find(requests, Api.channels.EditTitle).channel as Api.InputChannel;
+    const peer = find(requests, Api.messages.SendMessage).peer as Api.InputPeerChannel;
+
+    assert.equal(channel.channelId.toString(), "2000000042");
+    assert.equal(peer.channelId.toString(), "2000000042");
+    assert.equal(channel.accessHash.toString(), peer.accessHash.toString());
+  });
+
+  it("rejects a reference that is not one of ours", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    recorder(client);
+
+    await assert.rejects(
+      () => client.setForumTitle(new ForumRef("1", "nonsense"), "t"),
+      /Not a usable forum reference/,
+    );
   });
 });

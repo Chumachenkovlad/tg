@@ -19,7 +19,8 @@ and nothing the state file does not know as managed is read into, written to,
 modified or deleted.
 
 Duplicate safety is conditional on the committed `telegram/managed-state.json`
-being kept — see [Known limitation](#known-limitation).
+being kept, and applies are serialized only per machine — see
+[Known limitations](#known-limitations).
 
 ## Layout
 
@@ -199,6 +200,16 @@ It does not expire on its own. A dead holder and a slow one look identical
 from the outside, and guessing wrong means a duplicate group — so a stale
 lock is reported and left for you to delete.
 
+**The lock is machine-local.** It is a file on one filesystem, so it
+serializes applies on one machine only. Two Codespaces, two CI runners, or a
+laptop and a container running `telegram:apply` at the same time each take
+their own lock and neither sees the other — and both would plan from the same
+committed mapping and both create the forum. Nothing here prevents that; only
+a lock held somewhere both can reach would, and this PR does not add one.
+Until then, applying from one place at a time is a convention, not something
+the code enforces. Both commands print this alongside the durability
+warning.
+
 On top of the lock, the executor runs against the exact mapping snapshot the
 approved plan was computed from, and refuses if the stored mapping no longer
 matches it. That closes the time-of-check-to-time-of-use gap directly rather
@@ -263,6 +274,13 @@ is rewritten — dead ids are replaced, never kept alongside the new ones.
 - **File that exists but does not parse, or has the wrong shape** → the same
   hard error, for the same reason.
 
+The error says to **restore the file from git**
+(`git checkout -- telegram/managed-state.json`, or take it from an earlier
+commit) or repair it by hand. It never suggests deleting it: the file may be
+the only record that live Telegram chats belong to this project, and deleting
+it does not clean anything up — it orphans those chats and makes the next
+apply build a second set beside them.
+
 The shape differs from the sketch in the milestone brief in one way: forums
 are a map keyed by forum key rather than a single `forum` object with a `key`
 field. Same nesting, but the key cannot drift out of sync with its position,
@@ -294,6 +312,26 @@ that happens to carry the configured title. Destructive reconciliation
 | rename topic | `messages.editForumTopic` |
 | edit message | `messages.editMessage` |
 
+#### InputPeer vs. InputChannel
+
+`messages.*` takes `peer:InputPeer`; `channels.*` takes `channel:InputChannel`.
+The two carry the same channel id and access hash but are different
+constructors on the wire, so handing a `channels.*` method an
+`InputPeerChannel` produces a malformed request. The library types both
+parameters as the loose `TypeEntityLike`, which means the compiler will not
+catch the mistake.
+
+A `ForumRef` therefore carries the raw ids and nothing else, and
+`src/telegram/client.ts` keeps two helpers that wrap them per call site:
+
+```ts
+peerOf(forum)    // -> Api.InputPeerChannel, for messages.*
+channelOf(forum) // -> Api.InputChannel,     for channels.*
+```
+
+A test drives every call that takes a forum reference, captures the request
+objects and asserts each one got the constructor its TL line specifies.
+
 A new **top-level** message in a non-General forum topic is addressed with the
 topic id in `replyToMsgId` and **no** `topMsgId`:
 
@@ -318,6 +356,12 @@ calls `sendMessageToTopic(forum, topicId, text)`.
 - **Applies are serialized** by an exclusive lock held across the whole
   lifecycle, and the executor additionally refuses a plan whose base mapping
   has changed.
+- **The mapping is proved writable before the first creating call.** A plan
+  that creates anything runs `ensureWritable()` first, which writes a
+  throwaway probe file next to the state file — never over it. If the state
+  could not be saved, zero Telegram mutations are attempted: a forum created
+  against a read-only checkout would exist with nothing owning it, and the
+  next run would build a second one.
 - **Unknown flags are rejected** with exit code 2. A typo like `--yse` is an
   error, never a silent fall-through to the default. `telegram:plan` rejects
   `--yes` outright: it has nothing to confirm.
@@ -342,7 +386,7 @@ calls `sendMessageToTopic(forum, topicId, text)`.
   so even an accidental `console.log(ref)` cannot leak it, and it never
   reaches the committed state file.
 
-### Known limitation
+### Known limitations
 
 Duplicate safety is **conditional on `telegram/managed-state.json` being kept
 and committed**. There is no recovery of ownership from Telegram yet: nothing
@@ -352,6 +396,11 @@ machine or Codespace that ran it — the next apply will create a second forum.
 Both commands print this warning. Whether the mapping should become
 recoverable from Telegram, or be persisted somewhere else as well, is an open
 decision.
+
+**Applies are serialized per machine only.** The lock is a local file; two
+Codespaces or CI runners applying at the same time do not see each other's
+lock, would plan from the same committed mapping and would each create the
+forum. Apply from one place at a time until a shared lock exists.
 ## Where the session lives
 
 By default in `~/.tg-8042/` — a directory this app creates and owns, outside the

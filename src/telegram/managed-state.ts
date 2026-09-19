@@ -79,6 +79,15 @@ export class ManagedStateError extends Error {
 export interface ManagedStateStore {
   /** The recorded mapping, or an empty one when nothing was ever created. */
   load(): ManagedState;
+  /**
+   * Checks that a mapping could be written here, **without touching the one
+   * already stored**. Called before the first Telegram call that would
+   * produce an id to record: creating a forum and only then discovering the
+   * mapping cannot be saved leaves a group nothing knows it owns, which is
+   * the duplicate this whole model exists to avoid.
+   * Throws {@link ManagedStateError} when the location is not usable.
+   */
+  ensureWritable(): void;
   save(state: ManagedState): void;
   /** Human-readable location, for log messages. */
   describe(): string;
@@ -170,8 +179,7 @@ export function parseManagedState(raw: string, location: string): ManagedState {
     parsed = JSON.parse(raw);
   } catch (error) {
     throw new ManagedStateError(
-      `The state file at ${location} is not valid JSON. Fix or delete it — ` +
-        `deleting it makes the next run create a second forum.`,
+      `The state file at ${location} is not valid JSON. ${RECOVERY_ADVICE}`,
       { cause: error },
     );
   }
@@ -220,10 +228,24 @@ export function parseManagedState(raw: string, location: string): ManagedState {
   return { version: STATE_VERSION, forums };
 }
 
+/**
+ * What to do about a broken state file.
+ *
+ * Deliberately never "delete it". This file may be the only record that
+ * real Telegram groups, topics and messages belong to this project;
+ * deleting it does not clean anything up, it orphans live resources and
+ * makes the next apply build a second set beside them. It is tracked in
+ * git precisely so a good version can be recovered.
+ */
+const RECOVERY_ADVICE =
+  "Restore it from git (`git checkout -- telegram/managed-state.json`, or take " +
+  "it from an earlier commit) or repair it by hand. Do NOT delete it: it may be " +
+  "the only record that live Telegram chats belong to this project, and without " +
+  "it the next apply creates duplicates beside them rather than adopting them.";
+
 function malformed(location: string, detail: string): ManagedStateError {
   return new ManagedStateError(
-    `The state file at ${location} is malformed (${detail}). Fix or delete it — ` +
-      `deleting it makes the next run create a second forum.`,
+    `The state file at ${location} is malformed (${detail}). ${RECOVERY_ADVICE}`,
   );
 }
 
@@ -271,6 +293,21 @@ export function canonicalize(state: ManagedState): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Removes a temporary file, swallowing whatever goes wrong.
+ *
+ * Cleanup runs on the failure path, where the reason the temporary file is
+ * unremovable is usually the reason the write failed. Letting it throw would
+ * replace a message naming the real problem with an incidental one.
+ */
+function discard(path: string): void {
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    // Nothing useful to do, and nothing worth saying.
+  }
+}
+
+/**
  * Keeps the mapping in the repository's `telegram/managed-state.json`.
  *
  * Writes go through a temporary file in the same directory and are renamed
@@ -298,8 +335,9 @@ export class FileManagedStateStore implements ManagedStateStore {
       raw = readFileSync(this.path, "utf8");
     } catch (error) {
       throw new ManagedStateError(
-        `Cannot read the state file at ${this.describe()}. ` +
-          `Refusing to continue: treating it as empty would create duplicates.`,
+        `Cannot read the state file at ${this.describe()}. Refusing to continue: ` +
+          `treating it as empty would create duplicates beside the chats it records. ` +
+          `Fix the permissions, or restore the file from git.`,
         { cause: error },
       );
     }
@@ -314,11 +352,45 @@ export class FileManagedStateStore implements ManagedStateStore {
     return parseManagedState(raw, this.describe());
   }
 
+  /**
+   * Proves the mapping could be written, using a throwaway file next to it.
+   *
+   * Never the state file itself: the point is to find out whether a *future*
+   * write would work, and probing by writing over live identity data would
+   * risk the very thing it is checking for.
+   */
+  ensureWritable(): void {
+    const directory = dirname(this.path);
+    try {
+      if (!existsSync(directory)) mkdirSync(directory, { recursive: true });
+    } catch (error) {
+      throw new ManagedStateError(
+        `Cannot create the directory for the state file at ${this.describe()}.`,
+        { cause: error },
+      );
+    }
+
+    const probe = this.temporaryPath("probe");
+    try {
+      writeFileSync(probe, "", { encoding: "utf8", mode: STATE_FILE_MODE });
+    } catch (error) {
+      throw new ManagedStateError(
+        `Cannot write the state file at ${this.describe()}. Refusing to create ` +
+          `anything in Telegram that could not then be recorded.`,
+        { cause: error },
+      );
+    } finally {
+      // Best effort: removing the probe can fail for the same reason writing
+      // it did, and that failure must not replace the real diagnosis.
+      discard(probe);
+    }
+  }
+
   save(state: ManagedState): void {
     const directory = dirname(this.path);
     if (!existsSync(directory)) mkdirSync(directory, { recursive: true });
 
-    const temporary = join(directory, `.${basename(this.path)}.${randomBytes(6).toString("hex")}`);
+    const temporary = this.temporaryPath(randomBytes(6).toString("hex"));
     try {
       writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, {
         encoding: "utf8",
@@ -328,11 +400,16 @@ export class FileManagedStateStore implements ManagedStateStore {
       chmodSync(temporary, STATE_FILE_MODE);
       renameSync(temporary, this.path);
     } catch (error) {
-      rmSync(temporary, { force: true });
+      discard(temporary);
       throw new ManagedStateError(`Cannot write the state file at ${this.describe()}.`, {
         cause: error,
       });
     }
+  }
+
+  /** A sibling of the state file, so a rename into place stays atomic. */
+  private temporaryPath(suffix: string): string {
+    return join(dirname(this.path), `.${basename(this.path)}.${suffix}`);
   }
 
   describe(): string {
@@ -343,11 +420,20 @@ export class FileManagedStateStore implements ManagedStateStore {
 
 /** An in-memory store. Used by the tests, and by nothing else. */
 export class MemoryManagedStateStore implements ManagedStateStore {
+  /** Set to make the preflight fail, the way an unwritable checkout would. */
+  writableError: Error | undefined;
+  writableChecked = false;
+
   constructor(private state: ManagedState = emptyState()) {}
 
   load(): ManagedState {
     // Hand back a copy: a caller must not be able to edit the store in place.
     return parseManagedState(JSON.stringify(this.state), this.describe());
+  }
+
+  ensureWritable(): void {
+    this.writableChecked = true;
+    if (this.writableError) throw this.writableError;
   }
 
   save(state: ManagedState): void {

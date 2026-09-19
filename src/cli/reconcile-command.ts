@@ -90,6 +90,8 @@ export function durabilityWarning(location: string): string[] {
     "   Codespace it ran in, leaves chats nothing knows it owns, and the next",
     "   apply creates duplicates. Nothing recovers the mapping from Telegram",
     "   yet, so duplicate safety is conditional on this file being kept.",
+    "   The apply lock is machine-local: it does not stop a second apply running",
+    "   at the same time on another machine or Codespace.",
   ];
 }
 

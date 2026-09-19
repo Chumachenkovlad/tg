@@ -1,3 +1,4 @@
+import type bigInt from "big-integer";
 import { TelegramClient as MtprotoClient, Api } from "teleproto";
 import { generateRandomLong } from "teleproto/Helpers.js";
 import { StringSession } from "teleproto/sessions/index.js";
@@ -15,6 +16,17 @@ import {
   type ResolvedForum,
 } from "./forum-types.js";
 import type { AuthPrompts, SessionStore, TelegramAccount, TelegramConfig } from "./types.js";
+
+/**
+ * What a {@link ForumRef} carries: the two ids needed to address a channel.
+ *
+ * Kept as raw ids rather than a built TL object, because `messages.*` wants
+ * them as `InputPeerChannel` and `channels.*` as `InputChannel`.
+ */
+interface ChannelHandle {
+  channelId: bigInt.BigInteger;
+  accessHash: bigInt.BigInteger;
+}
 
 /** Tuning that callers may override per run. */
 export interface TelegramClientOptions {
@@ -210,13 +222,8 @@ export class TelegramAccountClient implements ForumApi {
       throw new Error("Telegram returned the supergroup without an access hash.");
     }
 
-    const peer = new Api.InputPeerChannel({
-      channelId: channel.id,
-      accessHash: channel.accessHash,
-    });
-
     return {
-      ref: new ForumRef(channel.id.toString(), peer),
+      ref: TelegramAccountClient.refFor(channel.id, channel.accessHash),
       id: channel.id.toString(),
       title: channel.title,
     };
@@ -296,10 +303,7 @@ export class TelegramAccountClient implements ForumApi {
       if (!entity.forum) continue;
 
       return {
-        ref: new ForumRef(
-          id,
-          new Api.InputPeerChannel({ channelId: entity.id, accessHash: entity.accessHash }),
-        ),
+        ref: TelegramAccountClient.refFor(entity.id, entity.accessHash),
         title: entity.title,
       };
     }
@@ -335,8 +339,9 @@ export class TelegramAccountClient implements ForumApi {
     if (messageIds.length === 0) return [];
 
     const result = await this.client.invoke(
+      // channels.getMessages takes `channel:InputChannel`, not an InputPeer.
       new Api.channels.GetMessages({
-        channel: TelegramAccountClient.peerOf(forum),
+        channel: TelegramAccountClient.channelOf(forum),
         id: messageIds.map((id) => new Api.InputMessageID({ id })),
       }),
     );
@@ -354,7 +359,8 @@ export class TelegramAccountClient implements ForumApi {
   /** Renames the forum in place. The channel id does not change. */
   async setForumTitle(forum: ForumRef, title: string): Promise<void> {
     await this.client.invoke(
-      new Api.channels.EditTitle({ channel: TelegramAccountClient.peerOf(forum), title }),
+      // channels.editTitle takes `channel:InputChannel`, not an InputPeer.
+      new Api.channels.EditTitle({ channel: TelegramAccountClient.channelOf(forum), title }),
     );
   }
 
@@ -380,13 +386,51 @@ export class TelegramAccountClient implements ForumApi {
     );
   }
 
-  /** Unwraps a ref back into the MTProto peer. The only place that may. */
-  private static peerOf(forum: ForumRef): Api.TypeInputPeer {
-    const peer = forum.unwrap();
-    if (!(peer instanceof Api.InputPeerChannel)) {
+  /**
+   * Builds a reference from what Telegram returned for a channel.
+   *
+   * The ref carries the raw ids only. Which TL type they are wrapped in
+   * depends on the method being called, so that choice is made per call by
+   * {@link peerOf} and {@link channelOf} rather than baked in here.
+   */
+  private static refFor(channelId: bigInt.BigInteger, accessHash: bigInt.BigInteger): ForumRef {
+    return new ForumRef(channelId.toString(), { channelId, accessHash } satisfies ChannelHandle);
+  }
+
+  /** Unwraps a ref. The only place that may. */
+  private static handleOf(forum: ForumRef): ChannelHandle {
+    const handle = forum.unwrap();
+    if (
+      typeof handle !== "object" ||
+      handle === null ||
+      !("channelId" in handle) ||
+      !("accessHash" in handle)
+    ) {
       throw new Error(`Not a usable forum reference: ${forum}`);
     }
-    return peer;
+    return handle as ChannelHandle;
+  }
+
+  /**
+   * For `messages.*`, whose TL parameter is `peer:InputPeer`.
+   *
+   * See {@link channelOf}: the two are not interchangeable, and picking the
+   * wrong one is a schema error the library's loose `TypeEntityLike` typing
+   * will not catch.
+   */
+  private static peerOf(forum: ForumRef): Api.InputPeerChannel {
+    return new Api.InputPeerChannel(TelegramAccountClient.handleOf(forum));
+  }
+
+  /**
+   * For `channels.*`, whose TL parameter is `channel:InputChannel`.
+   *
+   * `InputPeerChannel` and `InputChannel` carry the same two fields but are
+   * different constructors on the wire, so a `channels.*` call handed an
+   * `InputPeerChannel` is malformed.
+   */
+  private static channelOf(forum: ForumRef): Api.InputChannel {
+    return new Api.InputChannel(TelegramAccountClient.handleOf(forum));
   }
 
   private static chatsOf(updates: Api.TypeUpdates): Api.TypeChat[] {

@@ -19,6 +19,14 @@ import { dirname, join } from "node:path";
  * says so, naming the file. That is the safe way round: an automatic takeover
  * cannot tell a dead run from a slow one, and guessing wrong here means a
  * duplicate group.
+ *
+ * **It is machine-local.** The file lives on one filesystem, so it serializes
+ * applies on one machine only. Two Codespaces, two CI runners, or a laptop
+ * and a container running `telegram:apply` at the same time each take their
+ * own lock and neither sees the other. Nothing here prevents that; only a
+ * shared lock — held somewhere both can reach — would, and this PR does not
+ * add one. Until then, applying from one place at a time is a convention,
+ * not something the code enforces.
  */
 
 export const LOCK_FILE_NAME = "apply.lock";

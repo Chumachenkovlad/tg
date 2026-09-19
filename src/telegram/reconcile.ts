@@ -61,6 +61,15 @@ export async function applyPlan(
   }
   let state = plan.baseState;
 
+  // Anything that creates produces an id that has to be recorded. Find out
+  // now whether recording is even possible: a forum created against a
+  // read-only checkout would exist in Telegram with nothing owning it, and
+  // the next run would build a second one. An update-only plan records
+  // nothing, so it is not held up by this.
+  if (plan.actions.some((action) => action.type === "CREATE")) {
+    store.ensureWritable();
+  }
+
   for (const action of plan.actions) {
     const stateBefore = state;
 

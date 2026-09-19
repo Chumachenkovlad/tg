@@ -19,6 +19,7 @@ import {
   emptyState,
   recordForum,
   type ManagedState,
+  type ManagedStateStore,
 } from "../src/telegram/managed-state.js";
 import { MutationLockedError } from "../src/telegram/mutation-lock.js";
 import { buildPlan, countByType, hasMutations, type Plan } from "../src/telegram/planner.js";
@@ -494,9 +495,10 @@ describe("UPDATE reconciliation", () => {
     const { api, store } = await established();
     const before = JSON.stringify(store.load());
     let writes = 0;
-    const counting = {
+    const counting: ManagedStateStore = {
       load: () => store.load(),
-      save: (state: Parameters<typeof store.save>[0]) => {
+      ensureWritable: () => store.ensureWritable(),
+      save: (state) => {
         writes += 1;
         store.save(state);
       },
@@ -603,7 +605,6 @@ describe("the state file is not the source of truth", () => {
 describe("unmanaged entities are left alone", () => {
   it("ignores chats that are not in the state, however they are titled", async () => {
     const api = new FakeTelegram();
-    const store = new MemoryManagedStateStore();
     // A forum with exactly the configured title, created by someone else.
     // Identity is the recorded id, not the title, so this must not be adopted.
     api.forums.set("999000111", {
@@ -753,6 +754,68 @@ describe("a failed mutation does not claim later resources exist", () => {
 
     assert.equal(api.mutations.length, 1, "exactly one attempt");
     assert.deepEqual(store.load(), emptyState(), "nothing may be recorded");
+  });
+});
+
+describe("the mapping must be persistable before anything is created", () => {
+  it("performs zero Telegram mutations when the state cannot be written", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    const plan = await buildPlan(DESIRED_STATE, store.load(), api);
+    store.writableError = new ManagedStateError("Cannot write the state file (EACCES).");
+
+    await assert.rejects(() => applyPlan(plan, api, store), /Cannot write the state file/);
+
+    assert.deepEqual(
+      api.mutations,
+      [],
+      "no create, send or edit may go out when the id could not be recorded",
+    );
+  });
+
+  it("checks before the first call, not after it", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    const plan = await buildPlan(DESIRED_STATE, store.load(), api);
+    store.writableError = new ManagedStateError("nope");
+
+    await assert.rejects(() => applyPlan(plan, api, store));
+
+    assert.equal(store.writableChecked, true);
+    assert.deepEqual(store.load(), emptyState(), "and nothing was recorded either");
+  });
+
+  it("checks for a plan that creates", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+
+    await applyPlan(await buildPlan(DESIRED_STATE, store.load(), api), api, store);
+
+    assert.equal(store.writableChecked, true);
+  });
+
+  it("does not hold up an update-only plan, which records no new id", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    await reconcile(api, store);
+
+    const plan = await buildPlan(edited({ messageText: "v2" }), store.load(), api);
+    const fresh = new MemoryManagedStateStore(store.load());
+    fresh.writableError = new ManagedStateError("read-only checkout");
+
+    await assert.doesNotReject(() => applyPlan(plan, api, fresh));
+    assert.equal(fresh.writableChecked, false);
+  });
+
+  it("leaves the recorded mapping untouched while checking", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    await reconcile(api, store);
+    const before = JSON.stringify(store.load());
+
+    store.ensureWritable();
+
+    assert.equal(JSON.stringify(store.load()), before);
   });
 });
 

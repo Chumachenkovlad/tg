@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -136,7 +145,7 @@ describe("parseManagedState", () => {
   it("rejects invalid JSON rather than assuming nothing was created", () => {
     assert.throws(() => parseManagedState("{ not json", "test"), (error: unknown) => {
       assert.ok(error instanceof ManagedStateError);
-      assert.match(error.message, /create a second forum/);
+      assert.match(error.message, /creates duplicates/);
       return true;
     });
   });
@@ -224,8 +233,90 @@ describe("FileManagedStateStore", () => {
 
     assert.throws(() => new FileManagedStateStore(path).load(), (error: unknown) => {
       assert.ok(error instanceof ManagedStateError);
-      assert.match(error.message, /create a second forum/);
+      assert.match(error.message, /creates duplicates/);
       return true;
+    });
+  });
+
+  it("tells you to restore a corrupt file, never to delete it", () => {
+    // Deleting it does not clean anything up: it orphans whatever the file
+    // records and makes the next apply build a second set beside it.
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "{ truncated", "utf8");
+
+    assert.throws(() => new FileManagedStateStore(path).load(), (error: unknown) => {
+      assert.ok(error instanceof ManagedStateError);
+      assert.match(error.message, /Restore it from git/);
+      assert.match(error.message, /git checkout -- telegram\/managed-state\.json/);
+      assert.match(error.message, /Do NOT delete it/);
+      assert.ok(
+        !/delete it[—,.\s]+(?:the|deleting)/i.test(error.message.replace(/Do NOT delete it/, "")),
+        "the message must not suggest deleting the file",
+      );
+      return true;
+    });
+  });
+
+  describe("ensureWritable", () => {
+    it("passes for a location that can hold the file", () => {
+      assert.doesNotThrow(() => new FileManagedStateStore(path).ensureWritable());
+    });
+
+    it("creates the directory when it is missing", () => {
+      new FileManagedStateStore(path).ensureWritable();
+
+      assert.ok(existsSync(dirname(path)));
+    });
+
+    it("leaves no probe file behind", () => {
+      new FileManagedStateStore(path).ensureWritable();
+
+      assert.deepEqual(readdirSync(dirname(path)), [], "the probe must be cleaned up");
+    });
+
+    it("does not create, touch or modify the state file itself", () => {
+      const store = new FileManagedStateStore(path);
+      const recorded = recordTopic(
+        recordForum(emptyState(), "tsc8042", "42"),
+        "tsc8042",
+        "test",
+        100,
+      );
+      store.save(recorded);
+      const before = readFileSync(path, "utf8");
+
+      store.ensureWritable();
+
+      assert.equal(readFileSync(path, "utf8"), before, "the live mapping must be untouched");
+      assert.deepEqual(store.load(), recorded);
+    });
+
+    // These use a regular file where a directory belongs, rather than
+    // permissions: the outcome is then the same for every uid, where a
+    // chmod-based test quietly passes for root and proves nothing.
+    it("fails when the state file's directory is not a directory", () => {
+      const notADirectory = join(root, "in-the-way");
+      writeFileSync(notADirectory, "", "utf8");
+
+      assert.throws(
+        () => new FileManagedStateStore(join(notADirectory, "state.json")).ensureWritable(),
+        (error: unknown) => {
+          assert.ok(error instanceof ManagedStateError);
+          assert.match(error.message, /Refusing to create anything in Telegram/);
+          return true;
+        },
+      );
+    });
+
+    it("fails when the directory cannot be created", () => {
+      const notADirectory = join(root, "in-the-way");
+      writeFileSync(notADirectory, "", "utf8");
+
+      assert.throws(
+        () =>
+          new FileManagedStateStore(join(notADirectory, "sub", "state.json")).ensureWritable(),
+        /Cannot create the directory/,
+      );
     });
   });
 
@@ -242,7 +333,7 @@ describe("FileManagedStateStore", () => {
     assert.throws(() => new FileManagedStateStore(path).load(), (error: unknown) => {
       assert.ok(error instanceof ManagedStateError);
       assert.match(error.message, /exists but is empty/);
-      assert.match(error.message, /create a second forum/);
+      assert.match(error.message, /creates duplicates/);
       return true;
     });
   });
