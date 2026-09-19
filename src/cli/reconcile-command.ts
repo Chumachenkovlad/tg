@@ -1,6 +1,7 @@
 import { DESIRED_STATE, type DesiredState } from "../telegram/desired-state.js";
 import type { ForumApi } from "../telegram/forum-types.js";
 import type { ManagedStateStore } from "../telegram/managed-state.js";
+import type { MutationLock } from "../telegram/mutation-lock.js";
 import { buildPlan, formatPlan, hasMutations } from "../telegram/planner.js";
 import { applyPlan } from "../telegram/reconcile.js";
 import { parseBooleanFlags } from "./flags.js";
@@ -32,6 +33,13 @@ export interface ReconcileDeps {
   confirm(question: string): Promise<boolean>;
   log(message: string): void;
   stateStore: ManagedStateStore;
+  /**
+   * Taken for the whole apply lifecycle — reading state, planning, confirming
+   * and executing — because two applies that both planned from an empty state
+   * would each create the forum. Required rather than optional so no caller
+   * can quietly run an apply without it; plan mode never calls it.
+   */
+  acquireLock(): MutationLock;
   desired?: DesiredState;
 }
 
@@ -65,6 +73,26 @@ export function flagsFor(mode: ReconcileMode): string[] {
   return mode === "plan" ? ["help"] : ["yes", "help"];
 }
 
+/**
+ * Says out loud what the duplicate-safety actually rests on.
+ *
+ * The mapping is tracked in git, which is what carries ownership across a
+ * disposable checkout — but only once it is committed and pushed. An apply
+ * whose result stays in a Codespace that is then thrown away is an apply
+ * whose ownership is lost, and nothing recovers it from Telegram yet.
+ */
+export function durabilityWarning(location: string): string[] {
+  return [
+    "⚠  Ownership of these chats is recorded ONLY in:",
+    `     ${location}`,
+    "   It is tracked in git — commit and push it after every apply. An apply",
+    "   whose state file is never committed, or is lost with the machine or",
+    "   Codespace it ran in, leaves chats nothing knows it owns, and the next",
+    "   apply creates duplicates. Nothing recovers the mapping from Telegram",
+    "   yet, so duplicate safety is conditional on this file being kept.",
+  ];
+}
+
 export async function runReconcileCommand(
   argv: readonly string[],
   deps: ReconcileDeps,
@@ -77,6 +105,24 @@ export async function runReconcileCommand(
     return;
   }
 
+  if (mode !== "apply") {
+    await reconcile(flags, deps);
+    return;
+  }
+
+  // Held across reading the state, planning, confirming and executing: a
+  // second apply must not plan from the same state this one is about to act
+  // on. Planning is read-only and takes no lock.
+  const lock = deps.acquireLock();
+  try {
+    await reconcile(flags, deps);
+  } finally {
+    lock.release();
+  }
+}
+
+async function reconcile(flags: ReadonlySet<string>, deps: ReconcileDeps): Promise<void> {
+  const { mode, log } = deps;
   const desired = deps.desired ?? DESIRED_STATE;
   // Read before connecting: a malformed state file is a hard stop, and there
   // is no point opening a session just to fail on it.
@@ -89,6 +135,9 @@ export async function runReconcileCommand(
     log(mode === "plan" ? "Plan (read-only, nothing will be changed):" : "Plan:");
     log("");
     for (const line of formatPlan(plan)) log(line);
+    log("");
+
+    for (const line of durabilityWarning(deps.stateStore.describe())) log(line);
     log("");
 
     if (mode === "plan") {
@@ -112,6 +161,7 @@ export async function runReconcileCommand(
     log("");
     log(`Applied ${result.executed.length} action(s).`);
     log(`Identity state written to ${deps.stateStore.describe()}.`);
+    log("Commit and push it now — it is how the next run knows these chats are ours.");
   } finally {
     await session.close();
   }

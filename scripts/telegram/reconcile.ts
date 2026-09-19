@@ -19,6 +19,7 @@ import {
 import { TelegramAccountClient } from "../../src/telegram/client.js";
 import { loadLocalEnv, readConfig } from "../../src/telegram/config.js";
 import { FileManagedStateStore, statePathFor } from "../../src/telegram/managed-state.js";
+import { acquireMutationLock, lockPathFor } from "../../src/telegram/mutation-lock.js";
 import type { TelegramConfig } from "../../src/telegram/types.js";
 
 /** Asks for a typed confirmation. Anything but the exact word is a refusal. */
@@ -75,9 +76,11 @@ async function main(mode: ReconcileMode): Promise<void> {
     log: (message) => {
       console.log(message);
     },
-    stateStore: new FileManagedStateStore(statePathFor(config.sessionPath), {
-      ownsDirectory: config.ownsSessionDirectory,
-    }),
+    // Identity metadata lives in the repository and is committed.
+    stateStore: new FileManagedStateStore(statePathFor()),
+    // The lock is transient machine state, not identity: it belongs next to
+    // the session, outside the repository, and is never committed.
+    acquireLock: () => acquireMutationLock(lockPathFor(config.sessionPath)),
   });
 }
 

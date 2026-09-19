@@ -12,9 +12,14 @@ Current scope:
    `telegram:apply` closes it.
 
 Reconciliation is convergent: applying an unchanged configuration a second
-time sends no mutating request at all. No user is ever added or invited, no
-private message is sent, and nothing the state file does not know as managed
-is read into, written to, modified or deleted.
+time sends no mutating request at all. Editing a title or a message text in
+the configuration produces an in-place `UPDATE` of the existing resource, not
+a second one. No user is ever added or invited, no private message is sent,
+and nothing the state file does not know as managed is read into, written to,
+modified or deleted.
+
+Duplicate safety is conditional on the committed `telegram/managed-state.json`
+being kept — see [Known limitation](#known-limitation).
 
 ## Layout
 
@@ -25,14 +30,16 @@ leak into the rest of the project:
 | --- | --- |
 | `src/telegram/types.ts` | Library-agnostic types (`TelegramAccount`, `AuthPrompts`, `SessionStore`) |
 | `src/telegram/forum-types.ts` | Library-agnostic forum types (`DialogSummary`, `ForumRef`, `ForumApi`) |
-| `src/telegram/client.ts` | **The only module that imports `teleproto`** — connect / sign-in / `getMe` / dialogs / existence checks / creation |
+| `src/telegram/client.ts` | **The only module that imports `teleproto`** — connect / sign-in / `getMe` / dialogs / reads / creation / edits |
 | `src/telegram/config.ts` | Environment configuration |
 | `src/telegram/session-store.ts` | Session persistence on disk |
 | `src/telegram/format-dialogs.ts` | Rendering for the inspection output |
 | `src/telegram/desired-state.ts` | **What should exist**, by stable key |
-| `src/telegram/managed-state.ts` | **What was created**: logical key → Telegram id, persisted |
+| `src/telegram/managed-state.ts` | **What was created**: logical key → Telegram id, committed to git |
+| `src/telegram/mutation-lock.ts` | Exclusive lock serializing applies |
 | `src/telegram/planner.ts` | Compares the two against Telegram and produces the plan |
 | `src/telegram/reconcile.ts` | Executes a plan and records ids as they are confirmed |
+| `telegram/managed-state.json` | **The committed identity mapping** |
 | `src/cli/flags.ts` | Strict flag parsing — anything unrecognised is an error |
 | `src/cli/reconcile-command.ts` | `plan` and `apply`, with their side effects injected |
 | `scripts/telegram/auth.ts` | CLI: prompts + login flow |
@@ -113,9 +120,10 @@ it is looking at a different resource, and it does not.
 npm run telegram:plan
 ```
 
-Read-only. It connects, reads the recorded mapping, **verifies every id in it
-against Telegram**, compares the result with the desired state and prints the
-plan. It sends no request that could change anything.
+Read-only. It connects, reads the committed mapping, **verifies every id in
+it against Telegram** — including the title and text each resource currently
+has — compares that with the desired state and prints the plan. It sends no
+request that could change anything, and takes no lock.
 
 ```
   CREATE forum   tsc8042             (not created yet)
@@ -140,19 +148,68 @@ halfway through leaves the mapping describing exactly what exists.
 Run it again with an unchanged configuration and everything comes out `NOOP`:
 
 ```
-  NOOP   forum   tsc8042             (exists as 2000000042)
-  NOOP   topic   tsc8042/test        (exists as 100)
-  NOOP   message tsc8042/test/intro  (exists as 101)
+  NOOP   forum   tsc8042             (exists as 2000000042, title matches)
+  NOOP   topic   tsc8042/test        (exists as 100, title matches)
+  NOOP   message tsc8042/test/intro  (exists as 101, text matches)
 
 Already up to date. Nothing to do.
 ```
 
 No confirmation is asked for in that case — there is nothing to confirm.
 
-### The state file is not the source of truth
+### Editing the configuration
 
-The mapping lives at `~/.tg-8042/managed-state.json` (mode `600`, next to the
-session, outside the repository and git-ignored):
+Change a title or a message text, keep the key, and the next plan is an
+`UPDATE` of the resource that already exists:
+
+```
+  NOOP   forum   tsc8042             (exists as 2000000042, title matches)
+  UPDATE topic   tsc8042/test        (title is "🧪 Тест", should be "🗺 Маршрути 8042")
+  UPDATE message tsc8042/test/intro  (text is "v1", should be "v2")
+```
+
+Applying it renames the topic and edits the message **in place**. The channel
+id, the topic id and the message id are unchanged, so the mapping does not
+move and the run after it is all `NOOP` again.
+
+The comparison is against what Telegram currently holds, not against anything
+remembered locally: rename a topic by hand in the Telegram app and the next
+plan offers to put the configured title back.
+
+### Concurrency
+
+`telegram:apply` takes an exclusive lock for its whole lifecycle — acquire,
+load state, inspect Telegram, build the plan, confirm, apply, persist,
+release. Planning inside the lock is the point: two applies that each planned
+from an empty mapping would each create the forum, and the window between
+reading the state and writing it is several round-trips wide.
+
+The lock is a file created with `wx` (a single atomic syscall) at
+`~/.tg-8042/apply.lock` — transient machine state, so it lives next to the
+session and is never committed. A second apply fails with the holder's pid,
+host and start time, and whether that process still looks alive:
+
+```
+Another apply is already running: /home/you/.tg-8042/apply.lock exists.
+Held by pid 4711 on box, since 2026-09-19T10:04:00.000Z (that process is
+still running). Refusing to reconcile concurrently …
+```
+
+It does not expire on its own. A dead holder and a slow one look identical
+from the outside, and guessing wrong means a duplicate group — so a stale
+lock is reported and left for you to delete.
+
+On top of the lock, the executor runs against the exact mapping snapshot the
+approved plan was computed from, and refuses if the stored mapping no longer
+matches it. That closes the time-of-check-to-time-of-use gap directly rather
+than relying only on the lock.
+
+`telegram:plan` is read-only and takes no lock.
+
+### The state file: identity in git, truth in Telegram
+
+The mapping lives in the repository at `telegram/managed-state.json` **and is
+committed**:
 
 ```json
 {
@@ -166,35 +223,60 @@ session, outside the repository and git-ignored):
 }
 ```
 
-It records nothing but "the resource with key X was created as id Y". Whether
-Y still exists is a question only Telegram can answer, and the planner asks it
-every run: delete the topic by hand in the Telegram app and the next plan says
-`CREATE topic … (recorded topic 123 no longer exists in Telegram)`. Delete the
-group and the whole tree is planned again. After apply, the mapping is
-rewritten — the dead ids are replaced, never kept alongside the new ones.
+It is deployment identity metadata, which is why it belongs in git: a fresh
+clone — or a new Codespace — then knows which chats are already ours. A
+machine-local file would not survive that, and losing it means the next apply
+creates duplicates.
 
-The file holds **no credentials**: no access hash, no session. A forum's access
-hash is recovered from the chat list when its id is resolved, so losing this
-file costs the mapping and nothing more. Losing it does mean the next run
-believes nothing was created, which is why a corrupt or unreadable file is a
-hard error rather than a silent fallback to "empty".
+**Commit and push it after every apply.** The apply prints a reminder. An
+apply whose result is never committed has created chats that nothing records
+as owned.
 
-The shape differs from the sketch in the milestone brief in one way: forums are
-a map keyed by forum key rather than a single `forum` object with a `key`
+It contains only: the schema version, logical keys, the channel id, topic ids
+and managed message ids. It contains **no** api id or hash, no session or auth
+key, no access hash, no login or 2FA data, no phone number, no invite link and
+no personal data — which is what makes committing it safe. A test asserts the
+committed file is free of all of those, and another asserts it is not
+git-ignored.
+
+**The access hash is deliberately not persisted.** It is resolved from
+Telegram on every run from the stored channel id, by looking the channel up in
+the chat list. That keeps a credential out of the repository, and doubles as
+the existence check.
+
+The file records only "the resource with key X was created as id Y". Whether Y
+still exists, and what it currently says, are questions only Telegram can
+answer, and the planner asks every run: delete the topic by hand and the next
+plan says `CREATE topic … (recorded topic 123 no longer exists in Telegram)`.
+Delete the group and the whole tree is planned again. After apply the mapping
+is rewritten — dead ids are replaced, never kept alongside the new ones.
+
+#### Missing vs. empty
+
+- **Missing file** → initial bootstrap: a deployment that has never created
+  anything. This is the one supported way to start from empty. The repository
+  ships the file with no forums in it, so in practice it only happens before
+  that file was first committed.
+- **File that exists but is empty or whitespace-only** → `ManagedStateError`,
+  and the run stops. A truncated write is not a clean slate, and reading it as
+  one is precisely how a second forum gets built on top of the first.
+- **File that exists but does not parse, or has the wrong shape** → the same
+  hard error, for the same reason.
+
+The shape differs from the sketch in the milestone brief in one way: forums
+are a map keyed by forum key rather than a single `forum` object with a `key`
 field. Same nesting, but the key cannot drift out of sync with its position,
 and a second forum is a config change rather than a format change.
 
 ### Planner actions
 
-`NOOP`, `CREATE`, `UPDATE`, `DELETE`. This iteration plans only `NOOP` and
-`CREATE` — the test configuration needs nothing else. `UPDATE` and `DELETE`
-are declared in the action union and handled explicitly in the executor, where
-they throw "not implemented yet", so adding them is a contained change in the
-planner and the executor rather than a hunt through the code.
+`NOOP`, `CREATE`, `UPDATE`, `DELETE`. This iteration plans the first three.
+`DELETE` is declared in the action union and handled explicitly in the
+executor, where it refuses to run, so adding it is a contained change.
 
 A resource dropped from the desired state is **not** planned for deletion, and
-a chat that the state does not record as managed is never looked at — not even
-one that happens to carry the configured title. Destructive rebuild
+a chat the state does not record as managed is never looked at — not even one
+that happens to carry the configured title. Destructive reconciliation
 (`rebuild-managed`) comes separately.
 
 ### Telegram methods used
@@ -202,12 +284,15 @@ one that happens to carry the configured title. Destructive rebuild
 | Step | MTProto |
 | --- | --- |
 | inspection | `client.getDialogs()` (read-only) |
-| resolve a recorded forum | `client.getDialogs()` (read-only) |
-| does a topic still exist | `messages.getForumTopicsByID` (read-only) |
-| does a message still exist | `channels.getMessages` (read-only) |
-| forum | `channels.createChannel` with `megagroup: true, forum: true` |
-| topic | `messages.createForumTopic` |
-| message | `messages.sendMessage` |
+| resolve a recorded forum + its title | `client.getDialogs()` (read-only) |
+| do these topics exist, and their titles | `messages.getForumTopicsByID` (read-only) |
+| do these messages exist, and their text | `channels.getMessages` (read-only) |
+| create forum | `channels.createChannel` with `megagroup: true, forum: true` |
+| create topic | `messages.createForumTopic` |
+| send message | `messages.sendMessage` |
+| rename forum | `channels.editTitle` |
+| rename topic | `messages.editForumTopic` |
+| edit message | `messages.editMessage` |
 
 A new **top-level** message in a non-General forum topic is addressed with the
 topic id in `replyToMsgId` and **no** `topMsgId`:
@@ -230,12 +315,16 @@ calls `sendMessageToTopic(forum, topicId, text)`.
   the state file either.
 - **`apply` requires confirmation**, unless `--yes`. It asks only when the plan
   actually contains something to do.
+- **Applies are serialized** by an exclusive lock held across the whole
+  lifecycle, and the executor additionally refuses a plan whose base mapping
+  has changed.
 - **Unknown flags are rejected** with exit code 2. A typo like `--yse` is an
   error, never a silent fall-through to the default. `telegram:plan` rejects
   `--yes` outright: it has nothing to confirm.
 - **Convergence, not idempotence by luck.** Identity is the recorded id,
   verified against Telegram; nothing is matched by title, so a second run
-  cannot create a second anything.
+  cannot create a second anything, and a changed title is an edit rather than
+  a new resource.
 - **No retries on creating calls.** `apply` uses `requestRetries: 1`, and the
   executor has no loop and no `catch`: a failure stops the run.
   `channels.createChannel` carries no `random_id` for Telegram to deduplicate
@@ -244,13 +333,25 @@ calls `sendMessageToTopic(forum, topicId, text)`.
 - **Unmanaged entities are untouchable.** The executor acts only on planned
   actions, and the planner only ever names resources by key from the desired
   state, resolved through the recorded mapping.
-- **A corrupt state file stops the run**, because treating it as empty would
-  create duplicates.
-- **Nothing sensitive is printed** — not the session, the `api_hash`, the login
-  code, the 2FA password, the auth key, or any access hash. A forum's access
-  hash lives in a private field of `ForumRef`, whose `toString()`, `toJSON()`
-  and `util.inspect` output all expose the id only, so even an accidental
-  `console.log(ref)` cannot leak it.
+- **A corrupt or truncated state file stops the run**, because treating it as
+  empty would create duplicates.
+- **Nothing sensitive is printed or persisted** — not the session, the
+  `api_hash`, the login code, the 2FA password, the auth key, or any access
+  hash. A forum's access hash lives in a private field of `ForumRef`, whose
+  `toString()`, `toJSON()` and `util.inspect` output all expose the id only,
+  so even an accidental `console.log(ref)` cannot leak it, and it never
+  reaches the committed state file.
+
+### Known limitation
+
+Duplicate safety is **conditional on `telegram/managed-state.json` being kept
+and committed**. There is no recovery of ownership from Telegram yet: nothing
+inspects the account and works out which existing chats correspond to which
+keys. If the file is lost — not committed after an apply, or gone with the
+machine or Codespace that ran it — the next apply will create a second forum.
+Both commands print this warning. Whether the mapping should become
+recoverable from Telegram, or be persisted somewhere else as well, is an open
+decision.
 ## Where the session lives
 
 By default in `~/.tg-8042/` — a directory this app creates and owns, outside the
@@ -277,11 +378,12 @@ created with `700`.
   parse** is discarded with a warning and a login starts. A session that **cannot be
   read** (permissions, I/O) is a hard error: the CLI stops instead of quietly
   authorizing another device while the old session stays in place.
-- The reconciliation state file gets the same treatment: `600`, atomic replace,
-  and a directory the app does not own is never chmod-ed. It holds no
-  credential, but it does map out which chats this project manages.
-- `.env` is git-ignored, as are `.telegram/` and `managed-state.json` in case
-  you point `TELEGRAM_SESSION_PATH` inside the repository.
+- The reconciliation state file is an ordinary `644` repository file, written
+  atomically. It is committed on purpose and holds no credential — see
+  [the state file](#the-state-file-identity-in-git-truth-in-telegram).
+- `.env` is git-ignored, as is `.telegram/` in case you point
+  `TELEGRAM_SESSION_PATH` inside the repository, and `apply.lock`.
+  `telegram/managed-state.json` is deliberately **not** ignored.
 
 The session file is an auth key: anyone who has it can act as your Telegram account.
 Do not commit or share it. To revoke it, terminate the session in Telegram →
@@ -305,14 +407,20 @@ malformed-session fallback, read failures being fatal, and configuration validat
 
 For reconciliation they also cover: a first run planning three creates; a second
 run against the applied state planning zero mutations, repeatedly and with no
-duplicate group, topic or message; a stale topic mapping and a stale message
-mapping each being detected and recreated; a deleted forum putting the whole
-tree back; unmanaged chats being ignored even when one carries the configured
-title; `plan` mutating nothing and writing no state; a refused confirmation
-mutating nothing; a failed mutation recording only what really was created and
-the next run resuming without a duplicate; `UPDATE`/`DELETE` refusing to run
-rather than guessing; and — against the real request object — the topic send
-setting `replyToMsgId` and **not** `topMsgId`.
+duplicate group, topic or message; a changed forum title, topic title and
+message text each planning exactly one `UPDATE` and zero `CREATE`, editing the
+existing id, leaving every id unchanged and converging to all-`NOOP`
+afterwards; a stale topic mapping and a stale message mapping each being
+detected and recreated; a deleted forum putting the whole tree back; unmanaged
+chats being ignored even when one carries the configured title; `plan` mutating
+nothing, writing no state and taking no lock; a refused confirmation mutating
+nothing; a second apply being refused while the first holds the lock, and the
+lock being released on failure; a plan refusing to execute against a mapping
+that changed after it was built; an existing empty or whitespace-only state
+file being a hard error while a missing one bootstraps; the committed state
+file parsing, carrying no secret and not being git-ignored; and — against the
+real request object — the topic send setting `replyToMsgId` and **not**
+`topMsgId`.
 
 They never open a network connection and need no credentials: the Telegram layer
 is substituted by an in-memory fake, and the two client-level tests stub `invoke`

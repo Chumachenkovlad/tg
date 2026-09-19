@@ -70,6 +70,29 @@ export interface CreatedForum {
   title: string;
 }
 
+/**
+ * A forum recorded in local state, found alive in Telegram.
+ *
+ * Carries the title Telegram currently holds, which is what the planner
+ * compares the desired title against.
+ */
+export interface ResolvedForum {
+  ref: ForumRef;
+  title: string;
+}
+
+/** A topic found alive in Telegram, with the title it currently has. */
+export interface ExistingTopic {
+  id: number;
+  title: string;
+}
+
+/** A message found alive in Telegram, with the text it currently has. */
+export interface ExistingMessage {
+  id: number;
+  text: string;
+}
+
 /** A topic created inside a forum. */
 export interface CreatedTopic {
   /** Message id of the topic's service message — this is the topic id. */
@@ -95,17 +118,23 @@ export interface ForumApi {
   listGroupDialogs(): Promise<DialogSummary[]>;
 
   /**
-   * Read-only: resolves a recorded channel id back to a usable reference, or
-   * undefined when the forum no longer exists or is out of reach.
+   * Read-only: resolves a recorded channel id back to a usable reference and
+   * its current title, or undefined when the forum no longer exists or is out
+   * of reach.
    *
    * This is what keeps the local state file from being treated as the truth:
-   * every recorded id is looked up here before the planner believes it.
+   * every recorded id is looked up here before the planner believes it. The
+   * values come back with it, so the planner compares against Telegram rather
+   * than against anything it remembered.
    */
-  findForumById(id: string): Promise<ForumRef | undefined>;
-  /** Read-only: which of these topic ids still exist. */
-  listExistingTopicIds(forum: ForumRef, topicIds: readonly number[]): Promise<number[]>;
-  /** Read-only: which of these message ids still exist. */
-  listExistingMessageIds(forum: ForumRef, messageIds: readonly number[]): Promise<number[]>;
+  findForumById(id: string): Promise<ResolvedForum | undefined>;
+  /** Read-only: which of these topics still exist, and their current titles. */
+  listExistingTopics(forum: ForumRef, topicIds: readonly number[]): Promise<ExistingTopic[]>;
+  /** Read-only: which of these messages still exist, and their current text. */
+  listExistingMessages(
+    forum: ForumRef,
+    messageIds: readonly number[],
+  ): Promise<ExistingMessage[]>;
 
   /** Creates a private supergroup with forum topics enabled. */
   createForumSupergroup(title: string): Promise<CreatedForum>;
@@ -113,4 +142,11 @@ export interface ForumApi {
   createForumTopic(forum: ForumRef, title: string): Promise<CreatedTopic>;
   /** Sends one top-level message into a specific forum topic. */
   sendMessageToTopic(forum: ForumRef, topicId: number, text: string): Promise<PostedMessage>;
+
+  /** Renames a forum in place. Its channel id does not change. */
+  setForumTitle(forum: ForumRef, title: string): Promise<void>;
+  /** Renames a topic in place. Its topic id does not change. */
+  setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void>;
+  /** Edits a message's text in place. Its message id does not change. */
+  setMessageText(forum: ForumRef, messageId: number, text: string): Promise<void>;
 }

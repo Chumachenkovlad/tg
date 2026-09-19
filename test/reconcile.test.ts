@@ -7,14 +7,20 @@ import {
   type CreatedForum,
   type CreatedTopic,
   type DialogSummary,
+  type ExistingMessage,
+  type ExistingTopic,
   type ForumApi,
   type PostedMessage,
+  type ResolvedForum,
 } from "../src/telegram/forum-types.js";
 import {
+  ManagedStateError,
   MemoryManagedStateStore,
   emptyState,
+  recordForum,
   type ManagedState,
 } from "../src/telegram/managed-state.js";
+import { MutationLockedError } from "../src/telegram/mutation-lock.js";
 import { buildPlan, countByType, hasMutations, type Plan } from "../src/telegram/planner.js";
 import { applyPlan } from "../src/telegram/reconcile.js";
 
@@ -26,10 +32,21 @@ import { applyPlan } from "../src/telegram/reconcile.js";
  *
  * Nothing here touches the network.
  */
+interface FakeTopic {
+  title: string;
+  /** message id → its current text. */
+  messages: Map<number, string>;
+}
+
+interface FakeForum {
+  title: string;
+  topics: Map<number, FakeTopic>;
+}
+
 class FakeTelegram implements ForumApi {
   readonly calls: string[] = [];
-  /** channel id → its live topics and messages. */
-  readonly forums = new Map<string, { title: string; topics: Map<number, Set<number>> }>();
+  /** channel id → what Telegram currently holds for it. */
+  readonly forums = new Map<string, FakeForum>();
   /** Chats this account is in but does not manage. */
   unmanagedDialogs: DialogSummary[] = [];
   failAt: { call: string; error: Error } | undefined;
@@ -39,7 +56,9 @@ class FakeTelegram implements ForumApi {
 
   /** Mutating calls only — what the invariant is actually about. */
   get mutations(): string[] {
-    return this.calls.filter((call) => call.startsWith("create") || call.startsWith("send"));
+    return this.calls.filter(
+      (call) => call.startsWith("create") || call.startsWith("send") || call.startsWith("set"),
+    );
   }
 
   private record(call: string): void {
@@ -54,12 +73,18 @@ class FakeTelegram implements ForumApi {
 
   /** Deletes one message behind the reconciler's back. */
   deleteMessage(channelId: string, topicId: number, messageId: number): void {
-    this.forums.get(channelId)?.topics.get(topicId)?.delete(messageId);
+    this.forums.get(channelId)?.topics.get(topicId)?.messages.delete(messageId);
   }
 
   /** Removes the whole group, as leaving or deleting it would. */
   deleteForum(channelId: string): void {
     this.forums.delete(channelId);
+  }
+
+  private forum(id: string): FakeForum {
+    const entry = this.forums.get(id);
+    if (!entry) throw new Error(`fake: no such forum ${id}`);
+    return entry;
   }
 
   async listGroupDialogs(): Promise<DialogSummary[]> {
@@ -74,22 +99,38 @@ class FakeTelegram implements ForumApi {
     ];
   }
 
-  async findForumById(id: string): Promise<ForumRef | undefined> {
+  async findForumById(id: string): Promise<ResolvedForum | undefined> {
     this.record(`findForumById(${id})`);
-    return this.forums.has(id) ? new ForumRef(id, { channelId: id }) : undefined;
+    const entry = this.forums.get(id);
+    return entry ? { ref: new ForumRef(id, { channelId: id }), title: entry.title } : undefined;
   }
 
-  async listExistingTopicIds(forum: ForumRef, topicIds: readonly number[]): Promise<number[]> {
-    this.record(`listExistingTopicIds(${forum.id}, [${topicIds.join(",")}])`);
+  async listExistingTopics(
+    forum: ForumRef,
+    topicIds: readonly number[],
+  ): Promise<ExistingTopic[]> {
+    this.record(`listExistingTopics(${forum.id}, [${topicIds.join(",")}])`);
     const topics = this.forums.get(forum.id)?.topics;
-    return topicIds.filter((id) => topics?.has(id) === true);
+    return topicIds.flatMap((id) => {
+      const topic = topics?.get(id);
+      return topic ? [{ id, title: topic.title }] : [];
+    });
   }
 
-  async listExistingMessageIds(forum: ForumRef, messageIds: readonly number[]): Promise<number[]> {
-    this.record(`listExistingMessageIds(${forum.id}, [${messageIds.join(",")}])`);
-    const topics = this.forums.get(forum.id)?.topics;
-    const alive = new Set([...(topics?.values() ?? [])].flatMap((set) => [...set]));
-    return messageIds.filter((id) => alive.has(id));
+  async listExistingMessages(
+    forum: ForumRef,
+    messageIds: readonly number[],
+  ): Promise<ExistingMessage[]> {
+    this.record(`listExistingMessages(${forum.id}, [${messageIds.join(",")}])`);
+    const all = new Map(
+      [...(this.forums.get(forum.id)?.topics.values() ?? [])].flatMap((topic) => [
+        ...topic.messages,
+      ]),
+    );
+    return messageIds.flatMap((id) => {
+      const text = all.get(id);
+      return text === undefined ? [] : [{ id, text }];
+    });
   }
 
   async createForumSupergroup(title: string): Promise<CreatedForum> {
@@ -101,10 +142,8 @@ class FakeTelegram implements ForumApi {
 
   async createForumTopic(forum: ForumRef, title: string): Promise<CreatedTopic> {
     this.record(`createForumTopic(${forum.id}, ${title})`);
-    const entry = this.forums.get(forum.id);
-    if (!entry) throw new Error(`fake: no such forum ${forum.id}`);
     const id = this.nextMessageId++;
-    entry.topics.set(id, new Set());
+    this.forum(forum.id).topics.set(id, { title, messages: new Map() });
     return { id, title };
   }
 
@@ -114,11 +153,34 @@ class FakeTelegram implements ForumApi {
     text: string,
   ): Promise<PostedMessage> {
     this.record(`sendMessageToTopic(${forum.id}, ${topicId}, ${text})`);
-    const topic = this.forums.get(forum.id)?.topics.get(topicId);
+    const topic = this.forum(forum.id).topics.get(topicId);
     if (!topic) throw new Error(`fake: no such topic ${topicId}`);
     const id = this.nextMessageId++;
-    topic.add(id);
+    topic.messages.set(id, text);
     return { id, topicId };
+  }
+
+  async setForumTitle(forum: ForumRef, title: string): Promise<void> {
+    this.record(`setForumTitle(${forum.id}, ${title})`);
+    this.forum(forum.id).title = title;
+  }
+
+  async setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void> {
+    this.record(`setTopicTitle(${forum.id}, ${topicId}, ${title})`);
+    const topic = this.forum(forum.id).topics.get(topicId);
+    if (!topic) throw new Error(`fake: no such topic ${topicId}`);
+    topic.title = title;
+  }
+
+  async setMessageText(forum: ForumRef, messageId: number, text: string): Promise<void> {
+    this.record(`setMessageText(${forum.id}, ${messageId}, ${text})`);
+    for (const topic of this.forum(forum.id).topics.values()) {
+      if (topic.messages.has(messageId)) {
+        topic.messages.set(messageId, text);
+        return;
+      }
+    }
+    throw new Error(`fake: no such message ${messageId}`);
   }
 }
 
@@ -202,7 +264,11 @@ describe("the convergence invariant", () => {
 
     const [forum] = [...api.forums.values()];
     assert.equal(forum?.topics.size, 1, "exactly one topic");
-    assert.equal([...(forum?.topics.values() ?? [])][0]?.size, 1, "exactly one managed message");
+    assert.equal(
+      [...(forum?.topics.values() ?? [])][0]?.messages.size,
+      1,
+      "exactly one managed message",
+    );
   });
 
   it("records the mapping in the documented shape", async () => {
@@ -226,27 +292,222 @@ describe("the convergence invariant", () => {
     const store = new MemoryManagedStateStore();
     await reconcile(api, store);
 
-    const renamed: DesiredState = {
-      forums: [
-        {
-          key: "tsc8042",
-          title: "TSC 8042 Test (renamed)",
-          topics: [
-            {
-              key: "test",
-              title: "🧪 Тест (renamed)",
-              messages: [{ key: "intro", text: "Тест автоматизації Telegram API" }],
-            },
-          ],
-        },
-      ],
+    const plan = await buildPlan(edited({ forumTitle: "TSC 8042 Test (renamed)" }), store.load(), api);
+
+    assert.equal(countByType(plan).CREATE, 0, "a retitle must not plan a duplicate");
+  });
+});
+
+/** The desired state with one or more values changed. Keys stay the same. */
+function edited(changes: {
+  forumTitle?: string;
+  topicTitle?: string;
+  messageText?: string;
+}): DesiredState {
+  return {
+    forums: [
+      {
+        key: "tsc8042",
+        title: changes.forumTitle ?? "TSC 8042 Test",
+        topics: [
+          {
+            key: "test",
+            title: changes.topicTitle ?? "🧪 Тест",
+            messages: [
+              {
+                key: "intro",
+                text: changes.messageText ?? "Тест автоматизації Telegram API",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+describe("UPDATE reconciliation", () => {
+  /** Applies the default config, then returns the ids it produced. */
+  async function established(): Promise<{
+    api: FakeTelegram;
+    store: MemoryManagedStateStore;
+    forumId: string;
+    topicId: number;
+    messageId: number;
+  }> {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    await reconcile(api, store);
+    const state = store.load();
+    return {
+      api,
+      store,
+      forumId: state.forums.tsc8042?.id as string,
+      topicId: state.forums.tsc8042?.topics.test?.topicId as number,
+      messageId: state.forums.tsc8042?.topics.test?.messages.intro as number,
+    };
+  }
+
+  it("plans exactly one UPDATE and zero CREATE when the message text changes", async () => {
+    const { api, store } = await established();
+
+    const plan = await buildPlan(edited({ messageText: "v2" }), store.load(), api);
+
+    assert.deepEqual(planShape(plan), [
+      "NOOP forum tsc8042",
+      "NOOP topic tsc8042/test",
+      "UPDATE message tsc8042/test/intro",
+    ]);
+    assert.deepEqual(countByType(plan), { NOOP: 2, CREATE: 0, UPDATE: 1, DELETE: 0 });
+  });
+
+  it("plans an UPDATE and zero CREATE when the topic title changes", async () => {
+    const { api, store } = await established();
+
+    const plan = await buildPlan(edited({ topicTitle: "🗺 Маршрути 8042" }), store.load(), api);
+
+    assert.deepEqual(planShape(plan), [
+      "NOOP forum tsc8042",
+      "UPDATE topic tsc8042/test",
+      "NOOP message tsc8042/test/intro",
+    ]);
+    assert.equal(countByType(plan).CREATE, 0);
+  });
+
+  it("plans an UPDATE and zero CREATE when the forum title changes", async () => {
+    const { api, store } = await established();
+
+    const plan = await buildPlan(edited({ forumTitle: "TSC 8042 Prod" }), store.load(), api);
+
+    assert.deepEqual(planShape(plan), [
+      "UPDATE forum tsc8042",
+      "NOOP topic tsc8042/test",
+      "NOOP message tsc8042/test/intro",
+    ]);
+    assert.equal(countByType(plan).CREATE, 0);
+  });
+
+  it("says what the current value is and what it should become", async () => {
+    const { api, store } = await established();
+
+    const plan = await buildPlan(edited({ messageText: "v2" }), store.load(), api);
+
+    assert.match(plan.actions[2]?.reason ?? "", /text is "Тест автоматизації Telegram API"/);
+    assert.match(plan.actions[2]?.reason ?? "", /should be "v2"/);
+  });
+
+  it("edits the existing message id rather than sending a new message", async () => {
+    const { api, store, messageId } = await established();
+    const before = api.mutations.length;
+
+    await reconcile(api, store, edited({ messageText: "v2" }));
+
+    const performed = api.mutations.slice(before);
+    assert.deepEqual(performed, [
+      `setMessageText(${api.forums.keys().next().value as string}, ${messageId}, v2)`,
+    ]);
+    assert.ok(
+      !performed.some((call) => call.startsWith("sendMessageToTopic")),
+      "an edit must not send a second message",
+    );
+  });
+
+  it("keeps every id unchanged across all three updates", async () => {
+    const context = await established();
+    const { api, store, forumId, topicId, messageId } = context;
+
+    await reconcile(
+      api,
+      store,
+      edited({
+        forumTitle: "TSC 8042 Prod",
+        topicTitle: "🗺 Маршрути 8042",
+        messageText: "v2",
+      }),
+    );
+
+    const after = store.load();
+    assert.equal(after.forums.tsc8042?.id, forumId, "the channel id must not change");
+    assert.equal(after.forums.tsc8042?.topics.test?.topicId, topicId, "the topic id must not change");
+    assert.equal(
+      after.forums.tsc8042?.topics.test?.messages.intro,
+      messageId,
+      "the message id must not change",
+    );
+  });
+
+  it("converges: the plan right after applying the edit is all NOOP", async () => {
+    const { api, store } = await established();
+    const desired = edited({
+      forumTitle: "TSC 8042 Prod",
+      topicTitle: "🗺 Маршрути 8042",
+      messageText: "v2",
+    });
+
+    await reconcile(api, store, desired);
+    const plan = await buildPlan(desired, store.load(), api);
+
+    assert.deepEqual(planShape(plan), CONVERGED);
+    assert.equal(hasMutations(plan), false);
+  });
+
+  it("actually changes the values in Telegram", async () => {
+    const { api, store, forumId, topicId, messageId } = await established();
+
+    await reconcile(
+      api,
+      store,
+      edited({ forumTitle: "TSC 8042 Prod", topicTitle: "🗺 Маршрути", messageText: "v2" }),
+    );
+
+    const forum = api.forums.get(forumId);
+    assert.equal(forum?.title, "TSC 8042 Prod");
+    assert.equal(forum?.topics.get(topicId)?.title, "🗺 Маршрути");
+    assert.equal(forum?.topics.get(topicId)?.messages.get(messageId), "v2");
+  });
+
+  it("creates nothing new in Telegram while updating", async () => {
+    const { api, store, forumId, topicId } = await established();
+
+    await reconcile(api, store, edited({ messageText: "v2" }));
+
+    assert.equal(api.forums.size, 1);
+    assert.equal(api.forums.get(forumId)?.topics.size, 1);
+    assert.equal(api.forums.get(forumId)?.topics.get(topicId)?.messages.size, 1);
+  });
+
+  it("recreates rather than updates when the resource is actually gone", async () => {
+    const { api, store, forumId, topicId, messageId } = await established();
+    // Deleted and edited at once: gone beats changed, there is nothing to edit.
+    api.deleteMessage(forumId, topicId, messageId);
+
+    const plan = await buildPlan(edited({ messageText: "v2" }), store.load(), api);
+
+    assert.deepEqual(planShape(plan), [
+      "NOOP forum tsc8042",
+      "NOOP topic tsc8042/test",
+      "CREATE message tsc8042/test/intro",
+    ]);
+  });
+
+  it("writes no state for an update, since no id changed", async () => {
+    const { api, store } = await established();
+    const before = JSON.stringify(store.load());
+    let writes = 0;
+    const counting = {
+      load: () => store.load(),
+      save: (state: Parameters<typeof store.save>[0]) => {
+        writes += 1;
+        store.save(state);
+      },
+      describe: () => store.describe(),
     };
 
-    const plan = await buildPlan(renamed, store.load(), api);
+    const plan = await buildPlan(edited({ messageText: "v2" }), store.load(), api);
+    await applyPlan(plan, api, counting);
 
-    // Renaming is an UPDATE, which this iteration does not plan yet — but it
-    // must never look like a second resource that needs creating.
-    assert.equal(countByType(plan).CREATE, 0, "a retitle must not plan a duplicate");
+    assert.equal(writes, 0, "an in-place edit changes no mapping");
+    assert.equal(JSON.stringify(store.load()), before);
   });
 });
 
@@ -345,7 +606,10 @@ describe("unmanaged entities are left alone", () => {
     const store = new MemoryManagedStateStore();
     // A forum with exactly the configured title, created by someone else.
     // Identity is the recorded id, not the title, so this must not be adopted.
-    api.forums.set("999000111", { title: "TSC 8042 Test", topics: new Map([[5, new Set([6])]]) });
+    api.forums.set("999000111", {
+      title: "TSC 8042 Test",
+      topics: new Map([[5, { title: "🧪 Тест", messages: new Map([[6, "someone else's"]]) }]]),
+    });
 
     const plan = await buildPlan(DESIRED_STATE, emptyState(), api);
 
@@ -359,13 +623,18 @@ describe("unmanaged entities are left alone", () => {
   it("does not touch the unmanaged chat when the plan is applied", async () => {
     const api = new FakeTelegram();
     const store = new MemoryManagedStateStore();
-    const unmanaged = { title: "TSC 8042 Test", topics: new Map([[5, new Set([6])]]) };
+    const unmanaged: FakeForum = {
+      title: "TSC 8042 Test",
+      topics: new Map([[5, { title: "🧪 Тест", messages: new Map([[6, "someone else's"]]) }]]),
+    };
     api.forums.set("999000111", unmanaged);
 
     await reconcile(api, store);
 
+    assert.equal(unmanaged.title, "TSC 8042 Test", "its title is untouched");
     assert.deepEqual([...unmanaged.topics.keys()], [5], "its topics are untouched");
-    assert.deepEqual([...(unmanaged.topics.get(5) ?? [])], [6], "its messages are untouched");
+    assert.equal(unmanaged.topics.get(5)?.title, "🧪 Тест", "its topic title is untouched");
+    assert.equal(unmanaged.topics.get(5)?.messages.get(6), "someone else's", "its text is untouched");
     assert.ok(
       !api.calls.some((call) => call.includes("999000111")),
       "no call may even mention an unmanaged chat",
@@ -487,7 +756,7 @@ describe("a failed mutation does not claim later resources exist", () => {
   });
 });
 
-describe("UPDATE and DELETE are declared but not implemented", () => {
+describe("DELETE is declared but not implemented", () => {
   it("refuses to execute one rather than guessing", async () => {
     const api = new FakeTelegram();
     const store = new MemoryManagedStateStore();
@@ -496,17 +765,63 @@ describe("UPDATE and DELETE are declared but not implemented", () => {
         { type: "DELETE", resource: "topic", path: "tsc8042/test", reason: "handwritten" },
       ],
       resolvedForums: new Map(),
+      baseState: emptyState(),
     };
 
     await assert.rejects(() => applyPlan(plan, api, store), /DELETE is not implemented yet/);
     assert.deepEqual(api.mutations, []);
   });
+
+  it("is never planned for a resource dropped from the desired state", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    await reconcile(api, store);
+
+    const plan = await buildPlan({ forums: [] }, store.load(), api);
+
+    assert.equal(countByType(plan).DELETE, 0);
+  });
+});
+
+describe("the plan is executed against the mapping it was built from", () => {
+  it("refuses a plan whose state changed underneath it", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    // Built from an empty mapping: it says CREATE forum.
+    const plan = await buildPlan(DESIRED_STATE, store.load(), api);
+
+    // Something else finished a run in the meantime.
+    store.save(recordForum(emptyState(), "tsc8042", "2000000999"));
+
+    await assert.rejects(
+      () => applyPlan(plan, api, store),
+      (error: unknown) => {
+        assert.ok(error instanceof ManagedStateError);
+        assert.match(error.message, /changed after this plan was built/);
+        return true;
+      },
+    );
+    assert.deepEqual(api.mutations, [], "not one call may go out against stale state");
+  });
+
+  it("accepts a mapping that is equal but differently ordered", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    await reconcile(api, store);
+
+    const plan = await buildPlan(edited({ messageText: "v2" }), store.load(), api);
+    // Same content, rebuilt: key order is not a change.
+    store.save(JSON.parse(JSON.stringify(store.load())) as ManagedState);
+
+    await assert.doesNotReject(() => applyPlan(plan, api, store));
+  });
 });
 
 describe("the plan and apply commands", () => {
-  function harness(api: FakeTelegram, store: MemoryManagedStateStore) {
+  function harness(api: FakeTelegram, store: MemoryManagedStateStore, lockState = { held: false }) {
     const lines: string[] = [];
     let closes = 0;
+    const lockEvents: string[] = [];
     const session: ForumSession = {
       api,
       close: async () => {
@@ -515,6 +830,7 @@ describe("the plan and apply commands", () => {
     };
     return {
       lines,
+      lockEvents,
       closes: () => closes,
       session,
       run: (mode: "plan" | "apply", argv: readonly string[], confirmWith?: boolean) =>
@@ -524,6 +840,17 @@ describe("the plan and apply commands", () => {
           confirm: async () => {
             if (confirmWith === undefined) assert.fail("must not ask for confirmation here");
             return confirmWith;
+          },
+          acquireLock: () => {
+            if (lockState.held) throw new MutationLockedError("Another apply is already running");
+            lockState.held = true;
+            lockEvents.push(`acquired:${api.mutations.length}`);
+            return {
+              release: () => {
+                lockState.held = false;
+                lockEvents.push("released");
+              },
+            };
           },
           log: (message) => lines.push(message),
           stateStore: store,
@@ -613,6 +940,95 @@ describe("the plan and apply commands", () => {
     const applyRun = harness(api, store);
     await assert.rejects(() => applyRun.run("apply", ["--yes"]), /nope/);
     assert.equal(applyRun.closes(), 1);
+  });
+
+  it("takes the mutation lock before reading state or planning", async () => {
+    const api = new FakeTelegram();
+    const h = harness(api, new MemoryManagedStateStore());
+
+    await h.run("apply", ["--yes"]);
+
+    // Acquired at zero mutations, i.e. before anything ran, and released.
+    assert.deepEqual(h.lockEvents, ["acquired:0", "released"]);
+  });
+
+  it("refuses a second apply while the first holds the lock", async () => {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    const shared = { held: false };
+    const first = harness(api, store, shared);
+    const second = harness(api, store, shared);
+
+    // Hold the lock by never letting the first run's confirmation settle.
+    let releaseConfirm = (): void => {};
+    const firstRun = runReconcileCommand([], {
+      mode: "apply",
+      connect: async () => first.session,
+      confirm: () =>
+        new Promise<boolean>((resolveConfirm) => {
+          releaseConfirm = () => resolveConfirm(false);
+        }),
+      acquireLock: () => {
+        if (shared.held) throw new MutationLockedError("Another apply is already running");
+        shared.held = true;
+        return {
+          release: () => {
+            shared.held = false;
+          },
+        };
+      },
+      log: () => {},
+      stateStore: store,
+    });
+
+    await assert.rejects(() => second.run("apply", ["--yes"]), MutationLockedError);
+    assert.deepEqual(api.mutations, [], "the second apply must not touch Telegram");
+
+    releaseConfirm();
+    await firstRun;
+  });
+
+  it("releases the lock even when the apply fails", async () => {
+    const api = new FakeTelegram();
+    const shared = { held: false };
+    const h = harness(api, new MemoryManagedStateStore(), shared);
+    api.failAt = {
+      call: "createForumSupergroup(TSC 8042 Test)",
+      error: new Error("nope"),
+    };
+
+    await assert.rejects(() => h.run("apply", ["--yes"]), /nope/);
+
+    assert.equal(shared.held, false, "a failed apply must not leave the lock held");
+    assert.deepEqual(h.lockEvents, ["acquired:0", "released"]);
+  });
+
+  it("plan takes no lock, and runs while an apply holds one", async () => {
+    const api = new FakeTelegram();
+    const h = harness(api, new MemoryManagedStateStore(), { held: true });
+
+    await h.run("plan", []);
+
+    assert.deepEqual(h.lockEvents, [], "read-only work needs no lock");
+  });
+
+  it("warns that ownership depends on the committed state file", async () => {
+    const h = harness(new FakeTelegram(), new MemoryManagedStateStore());
+
+    await h.run("plan", []);
+    const output = h.lines.join("\n");
+
+    assert.match(output, /Ownership of these chats is recorded ONLY in/);
+    assert.match(output, /tracked in git — commit and push it after every apply/);
+    assert.match(output, /the next\s+apply creates duplicates/);
+  });
+
+  it("tells you to commit the state after a successful apply", async () => {
+    const h = harness(new FakeTelegram(), new MemoryManagedStateStore());
+
+    await h.run("apply", ["--yes"]);
+
+    assert.match(h.lines.join("\n"), /Commit and push it now/);
   });
 
   it("prints no access hash, session or api hash", async () => {

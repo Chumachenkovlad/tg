@@ -8,8 +8,11 @@ import {
   type CreatedForum,
   type CreatedTopic,
   type DialogSummary,
+  type ExistingMessage,
+  type ExistingTopic,
   type ForumApi,
   type PostedMessage,
+  type ResolvedForum,
 } from "./forum-types.js";
 import type { AuthPrompts, SessionStore, TelegramAccount, TelegramConfig } from "./types.js";
 
@@ -280,7 +283,7 @@ export class TelegramAccountClient implements ForumApi {
    * the chat list. That doubles as the existence check: a forum that was
    * deleted, or that this account has left, simply is not in the list.
    */
-  async findForumById(id: string): Promise<ForumRef | undefined> {
+  async findForumById(id: string): Promise<ResolvedForum | undefined> {
     const dialogs = await this.client.getDialogs();
 
     for (const dialog of dialogs) {
@@ -292,17 +295,23 @@ export class TelegramAccountClient implements ForumApi {
       // gone rather than trying to put topics into it.
       if (!entity.forum) continue;
 
-      return new ForumRef(
-        id,
-        new Api.InputPeerChannel({ channelId: entity.id, accessHash: entity.accessHash }),
-      );
+      return {
+        ref: new ForumRef(
+          id,
+          new Api.InputPeerChannel({ channelId: entity.id, accessHash: entity.accessHash }),
+        ),
+        title: entity.title,
+      };
     }
 
     return undefined;
   }
 
-  /** Read-only: which of these topic ids still exist in the forum. */
-  async listExistingTopicIds(forum: ForumRef, topicIds: readonly number[]): Promise<number[]> {
+  /** Read-only: which of these topics still exist, with their current titles. */
+  async listExistingTopics(
+    forum: ForumRef,
+    topicIds: readonly number[],
+  ): Promise<ExistingTopic[]> {
     if (topicIds.length === 0) return [];
 
     const result = await this.client.invoke(
@@ -313,17 +322,16 @@ export class TelegramAccountClient implements ForumApi {
     );
 
     // Deleted topics come back as ForumTopicDeleted, not as ForumTopic.
-    const alive = new Set(
-      result.topics.filter((topic) => topic instanceof Api.ForumTopic).map((topic) => topic.id),
-    );
-    return topicIds.filter((id) => alive.has(id));
+    return result.topics
+      .filter((topic): topic is Api.ForumTopic => topic instanceof Api.ForumTopic)
+      .map((topic) => ({ id: topic.id, title: topic.title }));
   }
 
-  /** Read-only: which of these message ids still exist in the forum. */
-  async listExistingMessageIds(
+  /** Read-only: which of these messages still exist, with their current text. */
+  async listExistingMessages(
     forum: ForumRef,
     messageIds: readonly number[],
-  ): Promise<number[]> {
+  ): Promise<ExistingMessage[]> {
     if (messageIds.length === 0) return [];
 
     const result = await this.client.invoke(
@@ -338,10 +346,38 @@ export class TelegramAccountClient implements ForumApi {
       result instanceof Api.messages.ChannelMessages || result instanceof Api.messages.Messages
         ? result.messages
         : [];
-    const alive = new Set(
-      messages.filter((message) => !(message instanceof Api.MessageEmpty)).map((m) => m.id),
+    return messages
+      .filter((message): message is Api.Message => message instanceof Api.Message)
+      .map((message) => ({ id: message.id, text: message.message }));
+  }
+
+  /** Renames the forum in place. The channel id does not change. */
+  async setForumTitle(forum: ForumRef, title: string): Promise<void> {
+    await this.client.invoke(
+      new Api.channels.EditTitle({ channel: TelegramAccountClient.peerOf(forum), title }),
     );
-    return messageIds.filter((id) => alive.has(id));
+  }
+
+  /** Renames a topic in place. The topic id does not change. */
+  async setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void> {
+    await this.client.invoke(
+      new Api.messages.EditForumTopic({
+        peer: TelegramAccountClient.peerOf(forum),
+        topicId,
+        title,
+      }),
+    );
+  }
+
+  /** Edits a message's text in place. The message id does not change. */
+  async setMessageText(forum: ForumRef, messageId: number, text: string): Promise<void> {
+    await this.client.invoke(
+      new Api.messages.EditMessage({
+        peer: TelegramAccountClient.peerOf(forum),
+        id: messageId,
+        message: text,
+      }),
+    );
   }
 
   /** Unwraps a ref back into the MTProto peer. The only place that may. */

@@ -1,5 +1,7 @@
 import type { ForumApi, ForumRef } from "./forum-types.js";
 import {
+  ManagedStateError,
+  canonicalize,
   recordForum,
   recordMessage,
   recordTopic,
@@ -43,9 +45,25 @@ export async function applyPlan(
   const step = options.onStep ?? (() => {});
   const forums = new Map<string, ForumRef>(plan.resolvedForums);
   const executed: PlannedAction[] = [];
-  let state = store.load();
+
+  // Execute against the exact mapping the plan was computed from, not
+  // whatever the store holds now. Re-reading here would be a time-of-check to
+  // time-of-use gap: a plan that says "CREATE forum" because the mapping was
+  // empty, applied to a mapping that meanwhile records one, builds a second
+  // group. The lock should already prevent that; this makes it impossible
+  // rather than merely unlikely, and catches an edit by hand too.
+  const current = store.load();
+  if (canonicalize(current) !== canonicalize(plan.baseState)) {
+    throw new ManagedStateError(
+      `The state at ${store.describe()} changed after this plan was built. ` +
+        `Refusing to apply a plan computed from a different mapping — re-run to replan.`,
+    );
+  }
+  let state = plan.baseState;
 
   for (const action of plan.actions) {
+    const stateBefore = state;
+
     switch (action.type) {
       case "NOOP":
         continue;
@@ -97,18 +115,50 @@ export async function applyPlan(
         break;
       }
 
-      // Not produced by this iteration's planner. Kept explicit so adding
-      // them is a change here and in the planner, and nowhere else.
-      case "UPDATE":
+      case "UPDATE": {
+        // Every update is in place, on the id the state already records, so
+        // none of them changes the mapping.
+        switch (action.resource) {
+          case "forum": {
+            step(`UPDATE forum ${action.path} → "${action.title}"`);
+            await api.setForumTitle(forumRef(forums, action.forumKey), action.title);
+            break;
+          }
+
+          case "topic": {
+            step(`UPDATE topic ${action.path} → "${action.title}"`);
+            await api.setTopicTitle(
+              forumRef(forums, action.forumKey),
+              action.topicId,
+              action.title,
+            );
+            break;
+          }
+
+          case "message": {
+            step(`UPDATE message ${action.path}`);
+            await api.setMessageText(
+              forumRef(forums, action.forumKey),
+              action.messageId,
+              action.text,
+            );
+            break;
+          }
+        }
+        break;
+      }
+
+      // Not produced by this iteration's planner: a resource dropped from the
+      // desired state is left alone until `rebuild-managed` lands. Kept
+      // explicit so adding it is a change here and in the planner, nowhere else.
       case "DELETE":
-        throw new Error(
-          `${action.type} is not implemented yet (${action.resource} ${action.path}).`,
-        );
+        throw new Error(`DELETE is not implemented yet (${action.resource} ${action.path}).`);
     }
 
     // Persisted per resource, not per run: a later failure must not undo the
-    // record of what already exists, and must not claim anything more.
-    store.save(state);
+    // record of what already exists, and must not claim anything more. An
+    // update changes no id, so there is nothing to write for it.
+    if (state !== stateBefore) store.save(state);
     executed.push(action);
   }
 

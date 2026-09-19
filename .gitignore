@@ -11,7 +11,11 @@ node_modules/
 # TELEGRAM_SESSION_PATH pointed inside it.
 .telegram/
 
-# Reconciliation identity mapping (logical key -> Telegram id). It lives next
-# to the session, so by default outside the repository; this covers a custom
-# session path pointed inside it. It is local machine state, never committed.
-managed-state.json
+# NOTE: telegram/managed-state.json is deliberately NOT ignored. It is
+# non-secret deployment identity metadata (logical key -> Telegram id) and is
+# committed, so a fresh checkout knows which chats are already ours.
+
+# The apply lock is transient machine state. It normally lives next to the
+# session, outside the repository; this covers a custom session path pointed
+# inside it.
+apply.lock

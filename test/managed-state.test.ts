@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -17,12 +18,54 @@ import {
 const mode = (path: string): number => statSync(path).mode & 0o777;
 
 describe("statePathFor", () => {
-  it("puts the state next to the session, in the app's own directory", () => {
-    assert.equal(statePathFor("/home/t/.tg-8042/session"), "/home/t/.tg-8042/managed-state.json");
+  it("puts the state in the repository, where git can track it", () => {
+    assert.equal(statePathFor("/work/tg"), "/work/tg/telegram/managed-state.json");
   });
 
-  it("follows a custom session path", () => {
-    assert.equal(statePathFor("/var/secrets/session"), "/var/secrets/managed-state.json");
+  it("defaults to the working directory", () => {
+    assert.equal(statePathFor(), join(process.cwd(), "telegram", "managed-state.json"));
+  });
+});
+
+describe("the committed state file", () => {
+  const committed = statePathFor(join(import.meta.dirname, ".."));
+
+  it("is in the repository and parses", () => {
+    const state = parseManagedState(readFileSync(committed, "utf8"), committed);
+
+    assert.equal(state.version, 1);
+  });
+
+  it("is not git-ignored, so an apply's result can be committed", () => {
+    // `git check-ignore -q` exits 0 when the path IS ignored and 1 when it is
+    // not. Not ignored is what this file needs: ignoring it would silently
+    // strand ownership on whichever machine ran the apply.
+    const checked = spawnSync("git", ["check-ignore", "-q", committed], {
+      cwd: join(import.meta.dirname, ".."),
+    });
+
+    assert.equal(checked.status, 1, "telegram/managed-state.json must not be git-ignored");
+  });
+
+  it("carries no secret", () => {
+    const raw = readFileSync(committed, "utf8").toLowerCase();
+
+    for (const secret of [
+      "accesshash",
+      "access_hash",
+      "authkey",
+      "auth_key",
+      "apihash",
+      "api_hash",
+      "api_id",
+      "session",
+      "phone",
+      "t.me/",
+      "joinchat",
+      "password",
+    ]) {
+      assert.ok(!raw.includes(secret), `the committed state must not contain ${secret}`);
+    }
   });
 });
 
@@ -137,22 +180,20 @@ describe("FileManagedStateStore", () => {
     assert.deepEqual(store.load(), state);
   });
 
-  it("writes the file owner-only, in an owner-only directory", () => {
-    const store = new FileManagedStateStore(path, { ownsDirectory: true });
+  it("writes an ordinary repository file, readable by the checkout", () => {
+    // It holds no secret, and it has to be readable wherever the repo is
+    // checked out — unlike the session, which stays 0600 outside the repo.
+    new FileManagedStateStore(path).save(emptyState());
 
-    store.save(emptyState());
-
-    assert.equal(mode(path), 0o600);
-    assert.equal(mode(dirname(path)), 0o700);
+    assert.equal(mode(path), 0o644);
   });
 
-  it("leaves a directory it does not own alone", () => {
+  it("leaves an existing directory's permissions alone", () => {
     mkdirSync(dirname(path), { recursive: true, mode: 0o755 });
 
-    new FileManagedStateStore(path, { ownsDirectory: false }).save(emptyState());
+    new FileManagedStateStore(path).save(emptyState());
 
-    assert.equal(mode(dirname(path)), 0o755, "a directory the user set up is not chmod-ed");
-    assert.equal(mode(path), 0o600, "the file is still ours to protect");
+    assert.equal(mode(dirname(path)), 0o755);
   });
 
   it("keeps the previous mapping when a write fails", () => {
@@ -188,11 +229,29 @@ describe("FileManagedStateStore", () => {
     });
   });
 
-  it("treats an empty file as no state, since nothing was recorded in it", () => {
-    new FileManagedStateStore(path).save(emptyState());
+  it("treats a missing file as the bootstrap case, and only that", () => {
+    // Nothing was ever created here. This is the one supported way to start
+    // from empty; the repository ships the file, so it is rare in practice.
+    assert.deepEqual(new FileManagedStateStore(path).load(), emptyState());
+  });
+
+  it("treats a zero-byte file as corruption, not as a first run", () => {
+    new FileManagedStateStore(path).save(recordForum(emptyState(), "tsc8042", "42"));
     writeFileSync(path, "", "utf8");
 
-    assert.deepEqual(new FileManagedStateStore(path).load(), emptyState());
+    assert.throws(() => new FileManagedStateStore(path).load(), (error: unknown) => {
+      assert.ok(error instanceof ManagedStateError);
+      assert.match(error.message, /exists but is empty/);
+      assert.match(error.message, /create a second forum/);
+      return true;
+    });
+  });
+
+  it("treats a whitespace-only file as corruption too", () => {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "   \n\t\n", "utf8");
+
+    assert.throws(() => new FileManagedStateStore(path).load(), ManagedStateError);
   });
 
   it("stores no credential", () => {

@@ -5,13 +5,20 @@ import { basename, dirname, join, relative } from "node:path";
 /**
  * The identity mapping between logical keys and Telegram ids.
  *
- * This is **not** the source of truth. It records nothing but "the resource
- * with key X was created as Telegram id Y"; whether Y still exists is a
- * question only Telegram can answer, and the planner asks it every run.
+ * It is **deployment identity metadata**, so it is tracked in git at
+ * `telegram/managed-state.json` and committed. That is what makes ownership
+ * survive a disposable checkout: a fresh clone knows which chats are already
+ * ours, where a machine-local file would not.
  *
- * It holds no credentials: no access hash, no session. An access hash is
- * recovered from the chat list when a forum is resolved, so losing this file
- * costs the mapping and nothing more.
+ * It is **not** the source of truth about Telegram. It records only "the
+ * resource with key X was created as Telegram id Y". Whether Y still exists,
+ * and what it is currently called, are questions only Telegram can answer,
+ * and the planner asks it every run.
+ *
+ * It holds **no secrets**, which is what makes committing it safe: no api id
+ * or hash, no session, no auth key, no access hash, no invite link, no phone
+ * number. An access hash is deliberately *not* persisted — it is resolved
+ * from Telegram on each run using the stored channel id.
  */
 
 export interface ManagedTopicState {
@@ -34,18 +41,25 @@ export interface ManagedState {
 }
 
 export const STATE_VERSION = 1;
+export const STATE_DIR_NAME = "telegram";
 export const STATE_FILE_NAME = "managed-state.json";
-/** Not a credential, but it maps out the account's managed chats. */
-export const STATE_FILE_MODE = 0o600;
-export const STATE_DIR_MODE = 0o700;
+/**
+ * An ordinary repository file: it carries no secret, and making it
+ * owner-only would only get in the way of the checkout that has to read it.
+ */
+export const STATE_FILE_MODE = 0o644;
 
 export function emptyState(): ManagedState {
   return { version: STATE_VERSION, forums: {} };
 }
 
-/** The state file sits next to the session, in the app's own directory. */
-export function statePathFor(sessionPath: string): string {
-  return join(dirname(sessionPath), STATE_FILE_NAME);
+/**
+ * The state file lives in the repository, at `telegram/managed-state.json`,
+ * and is committed. The session does not, and never will: that one is a
+ * credential and stays in the app's own directory outside the checkout.
+ */
+export function statePathFor(repositoryRoot: string = process.cwd()): string {
+  return join(repositoryRoot, STATE_DIR_NAME, STATE_FILE_NAME);
 }
 
 /**
@@ -217,33 +231,65 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * A stable text form of a state, for comparing two of them.
+ *
+ * Key order depends on the order things were written or parsed, so plain
+ * `JSON.stringify` would report two identical mappings as different. Sorting
+ * makes the comparison mean what it says.
+ */
+export function canonicalize(state: ManagedState): string {
+  const forums = Object.fromEntries(
+    Object.entries(state.forums)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([forumKey, forum]) => [
+        forumKey,
+        {
+          id: forum.id,
+          topics: Object.fromEntries(
+            Object.entries(forum.topics)
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+              .map(([topicKey, topic]) => [
+                topicKey,
+                {
+                  topicId: topic.topicId,
+                  messages: Object.fromEntries(
+                    Object.entries(topic.messages).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+                  ),
+                },
+              ]),
+          ),
+        },
+      ]),
+  );
+
+  return JSON.stringify({ version: state.version, forums });
+}
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 
-export interface FileManagedStateStoreOptions {
-  /** True only for the app's own directory; a user's own directory is left alone. */
-  ownsDirectory?: boolean;
-}
-
 /**
- * Keeps the mapping in a JSON file next to the session.
+ * Keeps the mapping in the repository's `telegram/managed-state.json`.
  *
  * Writes go through a temporary file in the same directory and are renamed
  * over the destination, so an interrupted write leaves the previous mapping
- * intact rather than a truncated one — losing the mapping means the next run
- * creates duplicates.
+ * intact rather than a truncated one.
  */
 export class FileManagedStateStore implements ManagedStateStore {
-  private readonly ownsDirectory: boolean;
+  constructor(private readonly path: string) {}
 
-  constructor(
-    private readonly path: string,
-    options: FileManagedStateStoreOptions = {},
-  ) {
-    this.ownsDirectory = options.ownsDirectory ?? false;
-  }
-
+  /**
+   * The recorded mapping.
+   *
+   * A **missing** file is the supported bootstrap case: a deployment that has
+   * never created anything. The repository ships the file with no forums in
+   * it, so in practice this only happens before the first commit of it.
+   *
+   * A file that **exists but is empty or malformed** is corruption, not a
+   * bootstrap, and is fatal — see {@link ManagedStateError}.
+   */
   load(): ManagedState {
     if (!existsSync(this.path)) return emptyState();
 
@@ -258,17 +304,19 @@ export class FileManagedStateStore implements ManagedStateStore {
       );
     }
 
-    if (raw.trim() === "") return emptyState();
+    if (raw.trim() === "") {
+      // A file that exists but holds nothing is a truncated write or a
+      // half-finished copy, not a first run. A first run has no file at all.
+      // Reading it as "nothing was created" is exactly how a second forum
+      // gets built on top of the first.
+      throw malformed(this.describe(), "the file exists but is empty");
+    }
     return parseManagedState(raw, this.describe());
   }
 
   save(state: ManagedState): void {
     const directory = dirname(this.path);
-    if (!existsSync(directory)) {
-      mkdirSync(directory, { recursive: true, mode: STATE_DIR_MODE });
-    } else if (this.ownsDirectory) {
-      chmodSync(directory, STATE_DIR_MODE);
-    }
+    if (!existsSync(directory)) mkdirSync(directory, { recursive: true });
 
     const temporary = join(directory, `.${basename(this.path)}.${randomBytes(6).toString("hex")}`);
     try {
