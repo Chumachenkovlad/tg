@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import bigInt from "big-integer";
+import { Api } from "teleproto";
 import { AuthKey } from "teleproto/crypto/AuthKey.js";
 import { StringSession } from "teleproto/sessions/index.js";
 import { TelegramAccountClient } from "../src/telegram/client.js";
+import { ForumRef } from "../src/telegram/forum-types.js";
 import { SessionReadError, SessionWriteError } from "../src/telegram/types.js";
 import type { AuthPrompts, SessionStore, TelegramConfig } from "../src/telegram/types.js";
 
@@ -228,5 +231,273 @@ describe("TelegramAccountClient.signIn", () => {
 
     assert.deepEqual(order, ["ensureWritable", "start"]);
     assert.equal(typeof store.saved, "string", "the session must be persisted after the login");
+  });
+});
+
+/** A ref shaped exactly as the client builds one: raw ids, no TL object. */
+const FORUM = new ForumRef("2000000042", {
+  channelId: bigInt(2000000042),
+  accessHash: bigInt(99),
+});
+
+describe("TelegramAccountClient.sendMessageToTopic", () => {
+  const forum = FORUM;
+
+  /**
+   * Replaces the underlying `invoke` so the request can be inspected without
+   * a connection, and answers with the Updates box Telegram would return.
+   */
+  function captureInvoke(client: TelegramAccountClient): { request: () => Api.AnyRequest } {
+    let captured: Api.AnyRequest | undefined;
+    const internals = client as unknown as {
+      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+    };
+    internals.client.invoke = async (request) => {
+      captured = request;
+      return new Api.Updates({
+        updates: [new Api.UpdateMessageID({ id: 501, randomId: bigInt(1) })],
+        users: [],
+        chats: [],
+        date: 0,
+        seq: 0,
+      });
+    };
+    return {
+      request: () => {
+        assert.ok(captured, "invoke was never called");
+        return captured;
+      },
+    };
+  }
+
+  it("does not set topMsgId when sending the root managed message", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const captured = captureInvoke(client);
+
+    await client.sendMessageToTopic(forum, 123, "hello");
+
+    const request = captured.request() as Api.messages.SendMessage;
+    const replyTo = request.replyTo as Api.InputReplyToMessage;
+
+    assert.ok(replyTo instanceof Api.InputReplyToMessage);
+    assert.equal(replyTo.replyToMsgId, 123, "the topic id addresses the topic");
+    assert.equal(
+      replyTo.topMsgId,
+      undefined,
+      "topMsgId is for replying to a message inside a topic, not for the topic itself",
+    );
+  });
+
+  it("sends the message to the forum peer with the given text", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const captured = captureInvoke(client);
+
+    await client.sendMessageToTopic(forum, 123, "hello");
+
+    const request = captured.request() as Api.messages.SendMessage;
+    assert.equal(request.message, "hello");
+    assert.equal((request.peer as Api.InputPeerChannel).channelId.toString(), "2000000042");
+  });
+
+  it("carries a random_id, so a redelivered send cannot duplicate the message", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const captured = captureInvoke(client);
+
+    await client.sendMessageToTopic(forum, 123, "hello");
+
+    const request = captured.request() as Api.messages.SendMessage;
+    assert.ok(request.randomId, "random_id must be set");
+  });
+
+  it("returns the id Telegram reports, against the topic it was sent to", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    captureInvoke(client);
+
+    assert.deepEqual(await client.sendMessageToTopic(forum, 123, "hello"), {
+      id: 501,
+      topicId: 123,
+    });
+  });
+});
+
+describe("TelegramAccountClient.createForumSupergroup", () => {
+  it("asks for a megagroup with forum topics enabled", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    let captured: Api.AnyRequest | undefined;
+    const internals = client as unknown as {
+      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+    };
+    internals.client.invoke = async (request) => {
+      captured = request;
+      return new Api.Updates({
+        updates: [],
+        users: [],
+        chats: [
+          new Api.Channel({
+            id: bigInt(2000000042),
+            accessHash: bigInt(99),
+            title: "TSC 8042 Test",
+            photo: new Api.ChatPhotoEmpty(),
+            date: 0,
+            megagroup: true,
+            forum: true,
+          }),
+        ],
+        date: 0,
+        seq: 0,
+      });
+    };
+
+    const created = await client.createForumSupergroup("TSC 8042 Test");
+
+    const request = captured as unknown as Api.channels.CreateChannel;
+    assert.equal(request.megagroup, true);
+    assert.equal(request.forum, true);
+    assert.equal(request.broadcast, undefined, "a broadcast channel cannot hold topics");
+    assert.equal(request.title, "TSC 8042 Test");
+    assert.equal(created.id, "2000000042");
+    assert.ok(!String(created.ref).includes("99"), "the access hash must not be printable");
+  });
+});
+
+/**
+ * Every Telegram RPC this client sends, checked against the official TL
+ * parameter type.
+ *
+ * `InputPeerChannel` and `InputChannel` carry the same two fields but are
+ * different constructors on the wire, and the library types both parameters
+ * as the loose `TypeEntityLike` — so nothing but a test like this catches a
+ * `channels.*` method handed an InputPeer.
+ *
+ * TL schema, for reference:
+ *   channels.createChannel      (no peer parameter)
+ *   channels.getMessages        channel:InputChannel
+ *   channels.editTitle          channel:InputChannel
+ *   messages.createForumTopic   peer:InputPeer
+ *   messages.sendMessage        peer:InputPeer
+ *   messages.editMessage        peer:InputPeer
+ *   messages.editForumTopic     peer:InputPeer
+ *   messages.getForumTopicsByID peer:InputPeer
+ */
+describe("TL parameter types", () => {
+  /** Captures every request, answering each with something plausible. */
+  function recorder(client: TelegramAccountClient): { requests: Api.AnyRequest[] } {
+    const requests: Api.AnyRequest[] = [];
+    const internals = client as unknown as {
+      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+    };
+    internals.client.invoke = async (request) => {
+      requests.push(request);
+      if (request instanceof Api.messages.GetForumTopicsByID) {
+        return new Api.messages.ForumTopics({
+          count: 0,
+          topics: [],
+          messages: [],
+          chats: [],
+          users: [],
+          pts: 0,
+        });
+      }
+      if (request instanceof Api.channels.GetMessages) {
+        return new Api.messages.ChannelMessages({
+          pts: 0,
+          count: 0,
+          messages: [],
+          topics: [],
+          chats: [],
+          users: [],
+        });
+      }
+      return new Api.Updates({
+        updates: [new Api.UpdateMessageID({ id: 7, randomId: bigInt(1) })],
+        users: [],
+        chats: [],
+        date: 0,
+        seq: 0,
+      });
+    };
+    return { requests };
+  }
+
+  /** Runs every call that takes a forum reference, once. */
+  async function callEverything(): Promise<Api.AnyRequest[]> {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const recorded = recorder(client);
+
+    await client.createForumTopic(FORUM, "t");
+    await client.sendMessageToTopic(FORUM, 1, "m");
+    await client.setForumTitle(FORUM, "t");
+    await client.setTopicTitle(FORUM, 1, "t");
+    await client.setMessageText(FORUM, 1, "m");
+    await client.listExistingTopics(FORUM, [1]);
+    await client.listExistingMessages(FORUM, [1]);
+
+    return recorded.requests;
+  }
+
+  function find<T extends Api.AnyRequest>(
+    requests: Api.AnyRequest[],
+    kind: new (...args: never[]) => T,
+  ): T {
+    const found = requests.find((request): request is T => request instanceof kind);
+    assert.ok(found, `no ${kind.name} request was sent`);
+    return found;
+  }
+
+  it("gives every channels.* method an InputChannel", async () => {
+    const requests = await callEverything();
+
+    for (const [name, request] of [
+      ["channels.getMessages", find(requests, Api.channels.GetMessages).channel],
+      ["channels.editTitle", find(requests, Api.channels.EditTitle).channel],
+    ] as const) {
+      assert.ok(
+        request instanceof Api.InputChannel,
+        `${name} must take InputChannel, got ${(request as object).constructor.name}`,
+      );
+      assert.ok(
+        !(request instanceof Api.InputPeerChannel),
+        `${name} must not be handed an InputPeerChannel`,
+      );
+    }
+  });
+
+  it("gives every messages.* method an InputPeer", async () => {
+    const requests = await callEverything();
+
+    for (const [name, peer] of [
+      ["messages.createForumTopic", find(requests, Api.messages.CreateForumTopic).peer],
+      ["messages.sendMessage", find(requests, Api.messages.SendMessage).peer],
+      ["messages.editMessage", find(requests, Api.messages.EditMessage).peer],
+      ["messages.editForumTopic", find(requests, Api.messages.EditForumTopic).peer],
+      ["messages.getForumTopicsByID", find(requests, Api.messages.GetForumTopicsByID).peer],
+    ] as const) {
+      assert.ok(
+        peer instanceof Api.InputPeerChannel,
+        `${name} must take InputPeerChannel, got ${(peer as object).constructor.name}`,
+      );
+      assert.ok(!(peer instanceof Api.InputChannel), `${name} must not be handed an InputChannel`);
+    }
+  });
+
+  it("carries the same ids whichever wrapper is used", async () => {
+    const requests = await callEverything();
+
+    const channel = find(requests, Api.channels.EditTitle).channel as Api.InputChannel;
+    const peer = find(requests, Api.messages.SendMessage).peer as Api.InputPeerChannel;
+
+    assert.equal(channel.channelId.toString(), "2000000042");
+    assert.equal(peer.channelId.toString(), "2000000042");
+    assert.equal(channel.accessHash.toString(), peer.accessHash.toString());
+  });
+
+  it("rejects a reference that is not one of ours", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    recorder(client);
+
+    await assert.rejects(
+      () => client.setForumTitle(new ForumRef("1", "nonsense"), "t"),
+      /Not a usable forum reference/,
+    );
   });
 });
