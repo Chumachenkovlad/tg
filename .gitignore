@@ -10,3 +10,8 @@ node_modules/
 # The default location is ~/.tg-8042/, outside the repository; this covers a
 # TELEGRAM_SESSION_PATH pointed inside it.
 .telegram/
+
+# Reconciliation identity mapping (logical key -> Telegram id). It lives next
+# to the session, so by default outside the repository; this covers a custom
+# session path pointed inside it. It is local machine state, never committed.
+managed-state.json

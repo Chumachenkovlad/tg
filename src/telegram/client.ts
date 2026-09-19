@@ -242,11 +242,14 @@ export class TelegramAccountClient implements ForumApi {
   }
 
   /**
-   * Sends one message into a specific forum topic.
+   * Sends one top-level message into a forum topic.
    *
-   * A forum topic is addressed through `reply_to`: `topMsgId` is the topic and
-   * `replyToMsgId` points at the topic's own service message, which is what a
-   * top-level message in that topic replies to.
+   * Telegram's forum API addresses a new top-level message in a non-General
+   * topic with `replyToMsgId` set to the topic id and **no** `topMsgId`:
+   * `topMsgId` is for replying to another message *inside* a topic, where
+   * `replyToMsgId` is that message and `topMsgId` is the topic containing it.
+   * Setting both here would claim this message replies to the topic's own
+   * service message within itself.
    */
   async sendMessageToTopic(
     forum: ForumRef,
@@ -258,10 +261,7 @@ export class TelegramAccountClient implements ForumApi {
         peer: TelegramAccountClient.peerOf(forum),
         message: text,
         randomId: generateRandomLong(),
-        replyTo: new Api.InputReplyToMessage({
-          replyToMsgId: topicId,
-          topMsgId: topicId,
-        }),
+        replyTo: new Api.InputReplyToMessage({ replyToMsgId: topicId }),
       }),
     );
 
@@ -270,6 +270,78 @@ export class TelegramAccountClient implements ForumApi {
       throw new Error("Telegram did not return the sent message id.");
     }
     return { id, topicId };
+  }
+
+  /**
+   * Read-only: resolves a channel id recorded in local state back to a usable
+   * reference, or undefined when the account can no longer reach it.
+   *
+   * The access hash is not persisted anywhere, so it is recovered here from
+   * the chat list. That doubles as the existence check: a forum that was
+   * deleted, or that this account has left, simply is not in the list.
+   */
+  async findForumById(id: string): Promise<ForumRef | undefined> {
+    const dialogs = await this.client.getDialogs();
+
+    for (const dialog of dialogs) {
+      const entity = dialog.entity;
+      if (!(entity instanceof Api.Channel)) continue;
+      if (entity.id.toString() !== id) continue;
+      if (entity.accessHash === undefined) continue;
+      // A channel that is no longer a forum cannot hold topics: treat it as
+      // gone rather than trying to put topics into it.
+      if (!entity.forum) continue;
+
+      return new ForumRef(
+        id,
+        new Api.InputPeerChannel({ channelId: entity.id, accessHash: entity.accessHash }),
+      );
+    }
+
+    return undefined;
+  }
+
+  /** Read-only: which of these topic ids still exist in the forum. */
+  async listExistingTopicIds(forum: ForumRef, topicIds: readonly number[]): Promise<number[]> {
+    if (topicIds.length === 0) return [];
+
+    const result = await this.client.invoke(
+      new Api.messages.GetForumTopicsByID({
+        peer: TelegramAccountClient.peerOf(forum),
+        topics: [...topicIds],
+      }),
+    );
+
+    // Deleted topics come back as ForumTopicDeleted, not as ForumTopic.
+    const alive = new Set(
+      result.topics.filter((topic) => topic instanceof Api.ForumTopic).map((topic) => topic.id),
+    );
+    return topicIds.filter((id) => alive.has(id));
+  }
+
+  /** Read-only: which of these message ids still exist in the forum. */
+  async listExistingMessageIds(
+    forum: ForumRef,
+    messageIds: readonly number[],
+  ): Promise<number[]> {
+    if (messageIds.length === 0) return [];
+
+    const result = await this.client.invoke(
+      new Api.channels.GetMessages({
+        channel: TelegramAccountClient.peerOf(forum),
+        id: messageIds.map((id) => new Api.InputMessageID({ id })),
+      }),
+    );
+
+    // A deleted message comes back as MessageEmpty in its slot.
+    const messages =
+      result instanceof Api.messages.ChannelMessages || result instanceof Api.messages.Messages
+        ? result.messages
+        : [];
+    const alive = new Set(
+      messages.filter((message) => !(message instanceof Api.MessageEmpty)).map((m) => m.id),
+    );
+    return messageIds.filter((id) => alive.has(id));
   }
 
   /** Unwraps a ref back into the MTProto peer. The only place that may. */

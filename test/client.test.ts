@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import bigInt from "big-integer";
+import { Api } from "teleproto";
 import { AuthKey } from "teleproto/crypto/AuthKey.js";
 import { StringSession } from "teleproto/sessions/index.js";
 import { TelegramAccountClient } from "../src/telegram/client.js";
+import { ForumRef } from "../src/telegram/forum-types.js";
 import { SessionReadError, SessionWriteError } from "../src/telegram/types.js";
 import type { AuthPrompts, SessionStore, TelegramConfig } from "../src/telegram/types.js";
 
@@ -228,5 +231,128 @@ describe("TelegramAccountClient.signIn", () => {
 
     assert.deepEqual(order, ["ensureWritable", "start"]);
     assert.equal(typeof store.saved, "string", "the session must be persisted after the login");
+  });
+});
+
+describe("TelegramAccountClient.sendMessageToTopic", () => {
+  const forum = new ForumRef(
+    "2000000042",
+    new Api.InputPeerChannel({ channelId: bigInt(2000000042), accessHash: bigInt(99) }),
+  );
+
+  /**
+   * Replaces the underlying `invoke` so the request can be inspected without
+   * a connection, and answers with the Updates box Telegram would return.
+   */
+  function captureInvoke(client: TelegramAccountClient): { request: () => Api.AnyRequest } {
+    let captured: Api.AnyRequest | undefined;
+    const internals = client as unknown as {
+      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+    };
+    internals.client.invoke = async (request) => {
+      captured = request;
+      return new Api.Updates({
+        updates: [new Api.UpdateMessageID({ id: 501, randomId: bigInt(1) })],
+        users: [],
+        chats: [],
+        date: 0,
+        seq: 0,
+      });
+    };
+    return {
+      request: () => {
+        assert.ok(captured, "invoke was never called");
+        return captured;
+      },
+    };
+  }
+
+  it("does not set topMsgId when sending the root managed message", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const captured = captureInvoke(client);
+
+    await client.sendMessageToTopic(forum, 123, "hello");
+
+    const request = captured.request() as Api.messages.SendMessage;
+    const replyTo = request.replyTo as Api.InputReplyToMessage;
+
+    assert.ok(replyTo instanceof Api.InputReplyToMessage);
+    assert.equal(replyTo.replyToMsgId, 123, "the topic id addresses the topic");
+    assert.equal(
+      replyTo.topMsgId,
+      undefined,
+      "topMsgId is for replying to a message inside a topic, not for the topic itself",
+    );
+  });
+
+  it("sends the message to the forum peer with the given text", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const captured = captureInvoke(client);
+
+    await client.sendMessageToTopic(forum, 123, "hello");
+
+    const request = captured.request() as Api.messages.SendMessage;
+    assert.equal(request.message, "hello");
+    assert.equal((request.peer as Api.InputPeerChannel).channelId.toString(), "2000000042");
+  });
+
+  it("carries a random_id, so a redelivered send cannot duplicate the message", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const captured = captureInvoke(client);
+
+    await client.sendMessageToTopic(forum, 123, "hello");
+
+    const request = captured.request() as Api.messages.SendMessage;
+    assert.ok(request.randomId, "random_id must be set");
+  });
+
+  it("returns the id Telegram reports, against the topic it was sent to", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    captureInvoke(client);
+
+    assert.deepEqual(await client.sendMessageToTopic(forum, 123, "hello"), {
+      id: 501,
+      topicId: 123,
+    });
+  });
+});
+
+describe("TelegramAccountClient.createForumSupergroup", () => {
+  it("asks for a megagroup with forum topics enabled", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    let captured: Api.AnyRequest | undefined;
+    const internals = client as unknown as {
+      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+    };
+    internals.client.invoke = async (request) => {
+      captured = request;
+      return new Api.Updates({
+        updates: [],
+        users: [],
+        chats: [
+          new Api.Channel({
+            id: bigInt(2000000042),
+            accessHash: bigInt(99),
+            title: "TSC 8042 Test",
+            photo: new Api.ChatPhotoEmpty(),
+            date: 0,
+            megagroup: true,
+            forum: true,
+          }),
+        ],
+        date: 0,
+        seq: 0,
+      });
+    };
+
+    const created = await client.createForumSupergroup("TSC 8042 Test");
+
+    const request = captured as unknown as Api.channels.CreateChannel;
+    assert.equal(request.megagroup, true);
+    assert.equal(request.forum, true);
+    assert.equal(request.broadcast, undefined, "a broadcast channel cannot hold topics");
+    assert.equal(request.title, "TSC 8042 Test");
+    assert.equal(created.id, "2000000042");
+    assert.ok(!String(created.ref).includes("99"), "the access hash must not be printable");
   });
 });

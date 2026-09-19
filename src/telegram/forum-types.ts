@@ -93,10 +93,24 @@ export interface PostedMessage {
 export interface ForumApi {
   /** Read-only: groups, supergroups, forums and channels in the chat list. */
   listGroupDialogs(): Promise<DialogSummary[]>;
+
+  /**
+   * Read-only: resolves a recorded channel id back to a usable reference, or
+   * undefined when the forum no longer exists or is out of reach.
+   *
+   * This is what keeps the local state file from being treated as the truth:
+   * every recorded id is looked up here before the planner believes it.
+   */
+  findForumById(id: string): Promise<ForumRef | undefined>;
+  /** Read-only: which of these topic ids still exist. */
+  listExistingTopicIds(forum: ForumRef, topicIds: readonly number[]): Promise<number[]>;
+  /** Read-only: which of these message ids still exist. */
+  listExistingMessageIds(forum: ForumRef, messageIds: readonly number[]): Promise<number[]>;
+
   /** Creates a private supergroup with forum topics enabled. */
   createForumSupergroup(title: string): Promise<CreatedForum>;
   /** Creates one topic in a forum. */
   createForumTopic(forum: ForumRef, title: string): Promise<CreatedTopic>;
-  /** Sends one message into a specific forum topic. */
+  /** Sends one top-level message into a specific forum topic. */
   sendMessageToTopic(forum: ForumRef, topicId: number, text: string): Promise<PostedMessage>;
 }

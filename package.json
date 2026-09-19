@@ -10,7 +10,8 @@
   "scripts": {
     "telegram:auth": "tsx scripts/telegram/auth.ts",
     "telegram:inspect": "tsx scripts/telegram/inspect.ts",
-    "telegram:create-test-forum": "tsx scripts/telegram/create-test-forum.ts",
+    "telegram:plan": "tsx scripts/telegram/plan.ts",
+    "telegram:apply": "tsx scripts/telegram/apply.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts"
   },
