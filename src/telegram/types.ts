@@ -9,6 +9,12 @@ export interface TelegramConfig {
   apiId: number;
   apiHash: string;
   sessionPath: string;
+  /**
+   * True when the session directory is the app's own default location, and its
+   * permissions may therefore be enforced. False for a custom session path:
+   * that directory belongs to the user and is never modified.
+   */
+  ownsSessionDirectory: boolean;
 }
 
 /** Safe subset of the signed-in account. Never carries credentials. */
@@ -20,9 +26,25 @@ export interface TelegramAccount {
   isBot: boolean;
 }
 
+/**
+ * Raised when a session exists but cannot be read (permissions, I/O, ...).
+ *
+ * This is deliberately fatal: silently starting a new login would leave the
+ * unreadable session behind and add another authorized device to the account.
+ */
+export class SessionReadError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "SessionReadError";
+  }
+}
+
 /** Where the session credential is kept between runs. */
 export interface SessionStore {
-  /** Previously saved session, or "" when there is none. */
+  /**
+   * Previously saved session, or "" when there is none.
+   * Throws {@link SessionReadError} when a session exists but cannot be read.
+   */
   load(): string;
   save(session: string): void;
   /** Human-readable location, for log messages. */

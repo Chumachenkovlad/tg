@@ -14,12 +14,15 @@ import type { AuthPrompts, SessionStore, TelegramAccount, TelegramConfig } from 
 export class TelegramAccountClient {
   private readonly client: MtprotoClient;
   private readonly session: StringSession;
+  private readonly restoredFromStore: boolean;
 
   private constructor(
     config: TelegramConfig,
     private readonly store: SessionStore,
   ) {
-    this.session = TelegramAccountClient.restoreSession(store);
+    const restored = TelegramAccountClient.restoreSession(store);
+    this.session = restored.session;
+    this.restoredFromStore = restored.reused;
     this.client = new MtprotoClient(this.session, config.apiId, config.apiHash, {
       connectionRetries: 5,
       // Keep the library quiet: its info-level output is noise for a CLI.
@@ -29,23 +32,37 @@ export class TelegramAccountClient {
 
   /** Builds a client that keeps its session in the configured local file. */
   static fromConfig(config: TelegramConfig, store?: SessionStore): TelegramAccountClient {
-    return new TelegramAccountClient(config, store ?? new FileSessionStore(config.sessionPath));
+    return new TelegramAccountClient(config, store ?? FileSessionStore.fromConfig(config));
   }
 
   /**
-   * Restores a saved session, falling back to an empty one when the stored
-   * value is missing or unreadable (which just means "log in again").
+   * Restores a saved session.
+   *
+   * No session at all means "log in", and a stored value that does not parse is
+   * discarded with a warning. A failed *read* (permissions, I/O) is different:
+   * it propagates, because starting a fresh login there would silently add
+   * another authorized device while the existing session stays in place.
    */
-  private static restoreSession(store: SessionStore): StringSession {
+  private static restoreSession(store: SessionStore): {
+    session: StringSession;
+    reused: boolean;
+  } {
+    const saved = store.load();
+    if (!saved) return { session: new StringSession(""), reused: false };
     try {
-      const saved = store.load();
-      if (!saved) return new StringSession("");
-      return new StringSession(saved);
+      return { session: new StringSession(saved), reused: true };
     } catch {
-      // Covers both a failed read (permissions, I/O) and a malformed value.
-      console.warn("Stored session is unreadable — ignoring it and logging in again.");
-      return new StringSession("");
+      console.warn("Stored session is malformed — ignoring it and logging in again.");
+      return { session: new StringSession(""), reused: false };
     }
+  }
+
+  /**
+   * Whether a stored session was accepted and is in use. The session value
+   * itself is never exposed — it is a credential.
+   */
+  get hasStoredSession(): boolean {
+    return this.restoredFromStore;
   }
 
   /** Where the session is persisted, for log messages. */

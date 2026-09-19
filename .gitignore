@@ -6,5 +6,7 @@ node_modules/
 .env
 .env.local
 
-# Telegram MTProto session (auth key) — sensitive credential
+# Telegram MTProto session (auth key) — sensitive credential.
+# The default location is ~/.tg-8042/, outside the repository; this covers a
+# TELEGRAM_SESSION_PATH pointed inside it.
 .telegram/

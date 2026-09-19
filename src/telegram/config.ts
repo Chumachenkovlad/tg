@@ -1,8 +1,19 @@
 import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import type { TelegramConfig } from "./types.js";
 
-const DEFAULT_SESSION_PATH = ".telegram/session";
+/**
+ * The app's own session directory, kept in the user's home rather than in the
+ * repository: it is created and owned by this app, so its permissions can be
+ * enforced without touching directories that belong to the user.
+ */
+export const APP_DIR_NAME = ".tg-8042";
+const SESSION_FILE_NAME = "session";
+
+export function defaultSessionPath(home: string = homedir()): string {
+  return join(home, APP_DIR_NAME, SESSION_FILE_NAME);
+}
 
 /**
  * Loads variables from a local .env file, if present.
@@ -20,7 +31,10 @@ export function loadLocalEnv(cwd: string = process.cwd()): void {
  * Reads the MTProto credentials from the environment.
  * Secrets are never logged — only their absence is reported.
  */
-export function readConfig(cwd: string = process.cwd()): TelegramConfig {
+export function readConfig(
+  cwd: string = process.cwd(),
+  home: string = homedir(),
+): TelegramConfig {
   const rawApiId = process.env.TELEGRAM_API_ID?.trim();
   const apiHash = process.env.TELEGRAM_API_HASH?.trim();
 
@@ -39,8 +53,22 @@ export function readConfig(cwd: string = process.cwd()): TelegramConfig {
     throw new Error("TELEGRAM_API_ID must be a positive integer.");
   }
 
-  const configured = process.env.TELEGRAM_SESSION_PATH?.trim() || DEFAULT_SESSION_PATH;
-  const sessionPath = isAbsolute(configured) ? configured : resolve(cwd, configured);
+  const custom = process.env.TELEGRAM_SESSION_PATH?.trim();
+  if (custom) {
+    // A path the user chose: the app writes the session file there, but the
+    // surrounding directory stays exactly as the user set it up.
+    return {
+      apiId,
+      apiHash: apiHash as string,
+      sessionPath: isAbsolute(custom) ? custom : resolve(cwd, custom),
+      ownsSessionDirectory: false,
+    };
+  }
 
-  return { apiId, apiHash: apiHash as string, sessionPath };
+  return {
+    apiId,
+    apiHash: apiHash as string,
+    sessionPath: defaultSessionPath(home),
+    ownsSessionDirectory: true,
+  };
 }
