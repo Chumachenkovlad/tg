@@ -1,0 +1,22 @@
+{
+  "name": "tg",
+  "version": "0.1.0",
+  "description": "Telegram MTProto user-account automation (GramJS).",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "telegram:auth": "tsx scripts/telegram/auth.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

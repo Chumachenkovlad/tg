@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+*.log
+
+# Local secrets — never commit
+.env
+.env.local
+
+# Telegram MTProto session (auth key) — sensitive credential
+.telegram/
