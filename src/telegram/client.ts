@@ -37,11 +37,12 @@ export class TelegramAccountClient {
    * value is missing or unreadable (which just means "log in again").
    */
   private static restoreSession(store: SessionStore): StringSession {
-    const saved = store.load();
-    if (!saved) return new StringSession("");
     try {
+      const saved = store.load();
+      if (!saved) return new StringSession("");
       return new StringSession(saved);
     } catch {
+      // Covers both a failed read (permissions, I/O) and a malformed value.
       console.warn("Stored session is unreadable — ignoring it and logging in again.");
       return new StringSession("");
     }

@@ -44,7 +44,8 @@ function promptSecret(question: string): Promise<string> {
 
 const prompts: AuthPrompts = {
   phoneNumber: () => prompt("Phone number (international format, e.g. +380...): "),
-  loginCode: () => prompt("Login code from Telegram: "),
+  // The login code is a credential as well: never echo it.
+  loginCode: () => promptSecret("Login code from Telegram: "),
   password: (hint?: string) =>
     promptSecret(hint ? `2FA password (hint: ${hint}): ` : "2FA password: "),
   onError: (message: string) => {
