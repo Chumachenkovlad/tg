@@ -1,10 +1,25 @@
 # tg
 
 Telegram MTProto automation for a personal (user) account, built on
-[GramJS](https://www.npmjs.com/package/telegram).
+[teleproto](https://www.npmjs.com/package/teleproto) (the maintained fork of GramJS).
 
 Current scope: **authentication only**. The script logs in, stores a local session
 and verifies it with `getMe()`. It does not send messages or modify anything.
+
+## Layout
+
+The MTProto library is isolated behind a small wrapper, so library details do not
+leak into the rest of the project:
+
+| File | Role |
+| --- | --- |
+| `src/telegram/types.ts` | Library-agnostic types (`TelegramAccount`, `AuthPrompts`, `SessionStore`) |
+| `src/telegram/client.ts` | **The only module that imports `teleproto`** — wraps connect / sign-in / `getMe` |
+| `src/telegram/config.ts` | Environment configuration |
+| `src/telegram/session-store.ts` | Session persistence on disk |
+| `scripts/telegram/auth.ts` | CLI: prompts + login flow |
+
+Swapping the MTProto library means rewriting `src/telegram/client.ts` only.
 
 ## Requirements
 

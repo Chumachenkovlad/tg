@@ -1,94 +1,95 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { TelegramClient } from "telegram";
-import { StringSession } from "telegram/sessions/index.js";
-import { Logger, LogLevel } from "telegram/extensions/Logger.js";
-
-const DEFAULT_SESSION_PATH = ".telegram/session";
-
-export interface TelegramConfig {
-  apiId: number;
-  apiHash: string;
-  sessionPath: string;
-}
+import { TelegramClient as MtprotoClient } from "teleproto";
+import { StringSession } from "teleproto/sessions/index.js";
+import { Logger, LogLevel } from "teleproto/extensions/Logger.js";
+import { FileSessionStore } from "./session-store.js";
+import type { AuthPrompts, SessionStore, TelegramAccount, TelegramConfig } from "./types.js";
 
 /**
- * Loads variables from a local .env file, if present.
- * Uses the built-in loader so no extra dependency is needed.
- * Real environment variables always win over the file.
+ * Thin wrapper around the MTProto library (`teleproto`).
+ *
+ * This is the ONLY module that imports the library. Everything else uses the
+ * library-agnostic types from `./types.js`, so swapping the implementation
+ * stays a one-file change.
  */
-export function loadLocalEnv(cwd: string = process.cwd()): void {
-  const envFile = resolve(cwd, ".env");
-  if (!existsSync(envFile)) return;
-  if (typeof process.loadEnvFile !== "function") return;
-  process.loadEnvFile(envFile);
-}
+export class TelegramAccountClient {
+  private readonly client: MtprotoClient;
+  private readonly session: StringSession;
 
-/**
- * Reads the MTProto credentials from the environment.
- * Secrets are never logged — only their absence is reported.
- */
-export function readConfig(cwd: string = process.cwd()): TelegramConfig {
-  const rawApiId = process.env.TELEGRAM_API_ID?.trim();
-  const apiHash = process.env.TELEGRAM_API_HASH?.trim();
-
-  const missing: string[] = [];
-  if (!rawApiId) missing.push("TELEGRAM_API_ID");
-  if (!apiHash) missing.push("TELEGRAM_API_HASH");
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing environment variable(s): ${missing.join(", ")}. ` +
-        `Copy .env.example to .env and fill in the values from https://my.telegram.org.`,
-    );
+  private constructor(
+    config: TelegramConfig,
+    private readonly store: SessionStore,
+  ) {
+    this.session = TelegramAccountClient.restoreSession(store);
+    this.client = new MtprotoClient(this.session, config.apiId, config.apiHash, {
+      connectionRetries: 5,
+      // Keep the library quiet: its info-level output is noise for a CLI.
+      baseLogger: new Logger(LogLevel.ERROR),
+    });
   }
 
-  const apiId = Number(rawApiId);
-  if (!Number.isInteger(apiId) || apiId <= 0) {
-    throw new Error("TELEGRAM_API_ID must be a positive integer.");
+  /** Builds a client that keeps its session in the configured local file. */
+  static fromConfig(config: TelegramConfig, store?: SessionStore): TelegramAccountClient {
+    return new TelegramAccountClient(config, store ?? new FileSessionStore(config.sessionPath));
   }
 
-  const configured = process.env.TELEGRAM_SESSION_PATH?.trim() || DEFAULT_SESSION_PATH;
-  const sessionPath = isAbsolute(configured) ? configured : resolve(cwd, configured);
-
-  return { apiId, apiHash: apiHash as string, sessionPath };
-}
-
-/** Reads a previously saved session string, or "" when there is none. */
-export function readSession(sessionPath: string): string {
-  if (!existsSync(sessionPath)) return "";
-  return readFileSync(sessionPath, "utf8").trim();
-}
-
-/**
- * Persists the session string with owner-only permissions.
- * The session is an auth key: treat it like a password.
- */
-export function saveSession(sessionPath: string, session: string): void {
-  mkdirSync(dirname(sessionPath), { recursive: true, mode: 0o700 });
-  writeFileSync(sessionPath, `${session}\n`, { encoding: "utf8", mode: 0o600 });
-}
-
-/**
- * Builds a session from the stored string, falling back to an empty one
- * when the file is missing or unreadable (which just means "log in again").
- */
-function restoreSession(sessionPath: string): StringSession {
-  const saved = readSession(sessionPath);
-  if (!saved) return new StringSession("");
-  try {
-    return new StringSession(saved);
-  } catch {
-    console.warn(`Stored session is unreadable — ignoring it and logging in again.`);
-    return new StringSession("");
+  /**
+   * Restores a saved session, falling back to an empty one when the stored
+   * value is missing or unreadable (which just means "log in again").
+   */
+  private static restoreSession(store: SessionStore): StringSession {
+    const saved = store.load();
+    if (!saved) return new StringSession("");
+    try {
+      return new StringSession(saved);
+    } catch {
+      console.warn("Stored session is unreadable — ignoring it and logging in again.");
+      return new StringSession("");
+    }
   }
-}
 
-/** Creates a GramJS client bound to the local session file. */
-export function createClient(config: TelegramConfig): TelegramClient {
-  const session = restoreSession(config.sessionPath);
-  return new TelegramClient(session, config.apiId, config.apiHash, {
-    connectionRetries: 5,
-    // Keep GramJS quiet: its info-level output is noise for a CLI login.
-    baseLogger: new Logger(LogLevel.ERROR),
-  });
+  /** Where the session is persisted, for log messages. */
+  get sessionLocation(): string {
+    return this.store.describe();
+  }
+
+  async connect(): Promise<void> {
+    await this.client.connect();
+  }
+
+  async isAuthorized(): Promise<boolean> {
+    return this.client.isUserAuthorized();
+  }
+
+  /**
+   * Runs the interactive login and persists the resulting session.
+   * Only called when there is no valid session yet.
+   */
+  async signIn(prompts: AuthPrompts): Promise<void> {
+    await this.client.start({
+      phoneNumber: () => prompts.phoneNumber(),
+      phoneCode: () => prompts.loginCode(),
+      password: (hint?: string) => prompts.password(hint),
+      onError: (error: Error) => {
+        prompts.onError?.(error.message);
+      },
+    });
+    this.store.save(this.session.save());
+  }
+
+  /** Verifies the session and returns only non-sensitive account fields. */
+  async getMe(): Promise<TelegramAccount> {
+    const me = await this.client.getMe();
+    return {
+      id: me.id.toString(),
+      ...(me.firstName ? { firstName: me.firstName } : {}),
+      ...(me.lastName ? { lastName: me.lastName } : {}),
+      ...(me.username ? { username: me.username } : {}),
+      isBot: me.bot === true,
+    };
+  }
+
+  async disconnect(): Promise<void> {
+    await this.client.disconnect();
+    await this.client.destroy();
+  }
 }

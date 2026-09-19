@@ -7,12 +7,13 @@
  * Later runs: reuses the stored session and only verifies it with getMe().
  *
  * Nothing sensitive is printed: no API hash, no session string, no code, no password.
+ * This script never touches the MTProto library directly — it goes through
+ * the wrapper in src/telegram/client.ts.
  */
 import { createInterface } from "node:readline";
-import { relative } from "node:path";
-import { Api } from "telegram";
-import type { StringSession } from "telegram/sessions/index.js";
-import { createClient, loadLocalEnv, readConfig, saveSession } from "../../src/telegram/client.js";
+import { TelegramAccountClient } from "../../src/telegram/client.js";
+import { loadLocalEnv, readConfig } from "../../src/telegram/config.js";
+import type { AuthPrompts, TelegramAccount } from "../../src/telegram/types.js";
 
 /** Asks a question and echoes what is typed. */
 function prompt(question: string): Promise<string> {
@@ -41,50 +42,46 @@ function promptSecret(question: string): Promise<string> {
   });
 }
 
-function describeAccount(me: Api.User | Api.InputPeerUser): string {
-  if (!(me instanceof Api.User)) {
-    return `  id:       ${me.userId}`;
-  }
-  const lines = [`  id:       ${me.id}`];
-  if (me.firstName) lines.push(`  name:     ${me.firstName}`);
-  if (me.username) lines.push(`  username: @${me.username}`);
-  if (me.bot) lines.push("  type:     bot");
+const prompts: AuthPrompts = {
+  phoneNumber: () => prompt("Phone number (international format, e.g. +380...): "),
+  loginCode: () => prompt("Login code from Telegram: "),
+  password: (hint?: string) =>
+    promptSecret(hint ? `2FA password (hint: ${hint}): ` : "2FA password: "),
+  onError: (message: string) => {
+    console.error(`Login error: ${message}`);
+  },
+};
+
+function describeAccount(account: TelegramAccount): string {
+  const lines = [`  id:       ${account.id}`];
+  const name = [account.firstName, account.lastName].filter(Boolean).join(" ");
+  if (name) lines.push(`  name:     ${name}`);
+  if (account.username) lines.push(`  username: @${account.username}`);
+  if (account.isBot) lines.push("  type:     bot");
   return lines.join("\n");
 }
 
 async function main(): Promise<void> {
   loadLocalEnv();
-  const config = readConfig();
-  const client = createClient(config);
-  const sessionFile = relative(process.cwd(), config.sessionPath);
+  const client = TelegramAccountClient.fromConfig(readConfig());
 
   try {
     await client.connect();
 
-    if (await client.isUserAuthorized()) {
-      console.log(`Reusing saved session (${sessionFile}).`);
+    if (await client.isAuthorized()) {
+      console.log(`Reusing saved session (${client.sessionLocation}).`);
     } else {
       console.log("No valid session found — starting interactive login.");
-      await client.start({
-        phoneNumber: () => prompt("Phone number (international format, e.g. +380...): "),
-        phoneCode: () => prompt("Login code from Telegram: "),
-        password: (hint?: string) =>
-          promptSecret(hint ? `2FA password (hint: ${hint}): ` : "2FA password: "),
-        onError: (err: Error) => {
-          console.error(`Login error: ${err.message}`);
-        },
-      });
-
-      saveSession(config.sessionPath, (client.session as StringSession).save());
-      console.log(`Session saved to ${sessionFile} (keep it secret, it is git-ignored).`);
+      await client.signIn(prompts);
+      console.log(
+        `Session saved to ${client.sessionLocation} (keep it secret, it is git-ignored).`,
+      );
     }
 
-    const me = await client.getMe();
     console.log("Authenticated as:");
-    console.log(describeAccount(me));
+    console.log(describeAccount(await client.getMe()));
   } finally {
     await client.disconnect();
-    await client.destroy();
   }
 }
 
