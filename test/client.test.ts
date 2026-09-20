@@ -475,7 +475,9 @@ describe("TL parameter types", () => {
     await client.sendMessageToTopic(FORUM, 1, "m");
     await client.setForumTitle(FORUM, "t");
     await client.setForumDescription(FORUM, "d");
-    await client.setTopicTitle(FORUM, 1, "t");
+    await client.setGeneralTopicHidden(FORUM, true);
+    await client.readGeneralTopic(FORUM);
+    await client.setTopicTitle(FORUM, 2, "t");
     await client.setMessageText(FORUM, 1, "m");
     await client.listExistingTopics(FORUM, [1]);
     await client.listExistingMessages(FORUM, [1]);
@@ -540,6 +542,109 @@ describe("TL parameter types", () => {
     assert.equal(channel.channelId.toString(), "2000000042");
     assert.equal(peer.channelId.toString(), "2000000042");
     assert.equal(channel.accessHash.toString(), peer.accessHash.toString());
+  });
+
+  /** A `messages.getForumTopicsByID` answer holding just the General topic. */
+  function generalTopic(hidden: boolean | undefined): Api.messages.ForumTopics {
+    return new Api.messages.ForumTopics({
+      count: 1,
+      topics: [
+        new Api.ForumTopic({
+          id: 1,
+          date: 0,
+          peer: new Api.PeerChannel({ channelId: bigInt(2000000042) }),
+          title: "General",
+          iconColor: 0,
+          topMessage: 0,
+          readInboxMaxId: 0,
+          readOutboxMaxId: 0,
+          unreadCount: 0,
+          unreadMentionsCount: 0,
+          unreadReactionsCount: 0,
+          unreadPollVotesCount: 0,
+          fromId: new Api.PeerUser({ userId: bigInt(1) }),
+          notifySettings: new Api.PeerNotifySettings({}),
+          ...(hidden === undefined ? {} : { hidden }),
+        }),
+      ],
+      messages: [],
+      chats: [],
+      users: [],
+      pts: 0,
+    });
+  }
+
+  /** Answers every request with the given General topic state. */
+  function generalReader(
+    client: TelegramAccountClient,
+    hidden: boolean | undefined,
+  ): { requests: Api.AnyRequest[] } {
+    const requests: Api.AnyRequest[] = [];
+    const internals = client as unknown as {
+      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+    };
+    internals.client.invoke = async (request) => {
+      requests.push(request);
+      return generalTopic(hidden);
+    };
+    return { requests };
+  }
+
+  it("reads General's hidden flag, asking for topic id 1 only", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const recorded = generalReader(client, true);
+
+    assert.deepEqual(await client.readGeneralTopic(FORUM), { hidden: true });
+
+    const request = recorded.requests[0] as Api.messages.GetForumTopicsByID;
+    assert.ok(request instanceof Api.messages.GetForumTopicsByID);
+    assert.deepEqual(request.topics, [1], "only General is asked about");
+  });
+
+  it("treats an absent `hidden` flag as visible, not as unknown", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    // TL flags are absent rather than false when unset, so `hidden` comes
+    // back undefined for a visible topic.
+    generalReader(client, undefined);
+
+    assert.deepEqual(await client.readGeneralTopic(FORUM), { hidden: false });
+  });
+
+  it("reports undefined when Telegram does not return General at all", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    recorder(client);
+
+    assert.equal(await client.readGeneralTopic(FORUM), undefined);
+  });
+
+  it("hides General with the `hidden` flag on messages.editForumTopic", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const recorded = recorder(client);
+
+    await client.setGeneralTopicHidden(FORUM, true);
+
+    const edits = recorded.requests.filter(
+      (request): request is Api.messages.EditForumTopic =>
+        request instanceof Api.messages.EditForumTopic,
+    );
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0]?.topicId, 1, "General is always topic id 1");
+    assert.equal(edits[0]?.hidden, true);
+    assert.equal(edits[0]?.title, undefined, "hiding must not rename it");
+    assert.equal(edits[0]?.closed, undefined, "hiding is not closing");
+  });
+
+  it("shows General again with the same flag set to false", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const recorded = recorder(client);
+
+    await client.setGeneralTopicHidden(FORUM, false);
+
+    const edit = recorded.requests.find(
+      (request): request is Api.messages.EditForumTopic =>
+        request instanceof Api.messages.EditForumTopic,
+    );
+    assert.equal(edit?.hidden, false);
   });
 
   it("reads the description back, so the planner compares against Telegram", async () => {

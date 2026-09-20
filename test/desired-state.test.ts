@@ -3,6 +3,8 @@ import { describe, it } from "node:test";
 import { TSC8042_FORUM } from "../src/telegram/content/tsc8042.js";
 import {
   DESIRED_STATE,
+  LIMITS,
+  characterCount,
   validateDesiredState,
   type DesiredForum,
 } from "../src/telegram/desired-state.js";
@@ -63,6 +65,72 @@ describe("the TSC 8042 desired state", () => {
     assert.deepEqual(
       forum().topics.map((topic) => topic.key),
       [...TOPIC_KEYS],
+    );
+  });
+
+  it("hides Telegram's built-in General topic, keeping its own `general` topic", () => {
+    assert.equal(forum().hideBuiltInGeneralTopic, true);
+    // The managed topic stays: it is ours, it is the one people are pointed
+    // at, and it is not the built-in one.
+    const general = forum().topics.find((topic) => topic.key === "general");
+    assert.ok(general, "the managed general topic must still be declared");
+    assert.equal(general.title, "💬 Загальні питання");
+  });
+});
+
+describe("the rules topic carries the navigation", () => {
+  const rules = (): string => {
+    const topic = forum().topics.find((entry) => entry.key === "rules");
+    assert.ok(topic);
+    const intro = topic.messages.find((message) => message.key === "intro");
+    assert.ok(intro);
+    return intro.text;
+  };
+
+  it("has a navigation section, as its title promises", () => {
+    assert.match(rules(), /Навігація/u);
+  });
+
+  /**
+   * Topics the navigation deliberately does not list.
+   *
+   * `rules` is where the reader already is, `announcements` is read rather
+   * than posted to, and `successful-exams` is left out to keep the section
+   * short — reports of a passed exam have the obvious home in `exam-reports`.
+   */
+  const NOT_SIGNPOSTED = ["rules", "announcements", "successful-exams"];
+
+  it("points at every topic a person might need to find", () => {
+    const signposted = forum().topics.filter((topic) => !NOT_SIGNPOSTED.includes(topic.key));
+
+    for (const topic of signposted) {
+      assert.ok(
+        rules().includes(topic.title),
+        `the navigation must point at "${topic.title}" (${topic.key})`,
+      );
+    }
+  });
+
+  it("names each destination exactly as the topic is titled", () => {
+    // Copy-pasted titles, not paraphrases: retitle a topic and this fails,
+    // which is the reminder to update the navigation with it.
+    const navigation = rules().slice(rules().indexOf("Навігація"));
+    const bullets = navigation.split("\n").filter((line) => line.startsWith("•"));
+
+    assert.equal(bullets.length, 11, "one line per signposted topic");
+    for (const bullet of bullets) {
+      assert.ok(
+        forum().topics.some((topic) => bullet.includes(topic.title)),
+        `navigation line does not name a configured topic: ${bullet}`,
+      );
+    }
+  });
+
+  it("stays compact", () => {
+    const navigation = rules().slice(rules().indexOf("Навігація"));
+    assert.ok(
+      characterCount(navigation) < 900,
+      `the navigation section is ${characterCount(navigation)} characters, which is not compact`,
     );
   });
 });
@@ -187,6 +255,7 @@ describe("validateDesiredState", () => {
     key: "a",
     title: "A",
     description: "",
+    hideBuiltInGeneralTopic: false,
     topics: [],
     ...over,
   });
@@ -273,5 +342,86 @@ describe("validateDesiredState", () => {
 
   it("accepts an empty description, which is a legitimate choice", () => {
     assert.doesNotThrow(() => validateDesiredState({ forums: [forumOf({ description: "" })] }));
+  });
+
+  describe("Telegram's length limits", () => {
+    /** A string of exactly `n` code points. */
+    const text = (n: number): string => "я".repeat(n);
+
+    /** The fixture with one over-long value, built at the given length. */
+    const withLength: Record<string, (n: number) => DesiredForum> = {
+      "forum title": (n) => forumOf({ title: text(n) }),
+      "forum description": (n) => forumOf({ description: text(n) }),
+      "topic title": (n) => forumOf({ topics: [{ key: "t", title: text(n), messages: [] }] }),
+      "message text": (n) =>
+        forumOf({
+          topics: [{ key: "t", title: "T", messages: [{ key: "m", text: text(n) }] }],
+        }),
+    };
+
+    const CASES = [
+      ["forum title", LIMITS.forumTitle, 128],
+      ["forum description", LIMITS.forumDescription, 255],
+      ["topic title", LIMITS.topicTitle, 128],
+      ["message text", LIMITS.messageText, 4096],
+    ] as const;
+
+    for (const [what, limit, expected] of CASES) {
+      it(`caps the ${what} at ${expected}`, () => {
+        assert.equal(limit, expected, "the documented limit must not drift");
+      });
+
+      it(`accepts a ${what} of exactly ${expected} characters`, () => {
+        const build = withLength[what];
+        assert.ok(build);
+        assert.doesNotThrow(() => validateDesiredState({ forums: [build(limit)] }));
+      });
+
+      it(`rejects a ${what} one character over`, () => {
+        const build = withLength[what];
+        assert.ok(build);
+        assert.throws(
+          () => validateDesiredState({ forums: [build(limit + 1)] }),
+          new RegExp(`is ${limit + 1} characters, over Telegram's limit of ${limit}`),
+        );
+      });
+    }
+
+    it("counts code points, not UTF-16 units", () => {
+      // "👮" is one character to Telegram and two to String.length. Counting
+      // the wrong one would reject a title Telegram accepts.
+      assert.equal(characterCount("👮"), 1);
+      assert.equal("👮".length, 2);
+
+      const title = "👮".repeat(LIMITS.forumTitle);
+      assert.equal(title.length, LIMITS.forumTitle * 2, "the naive count would be over the limit");
+      assert.doesNotThrow(() => validateDesiredState({ forums: [forumOf({ title })] }));
+    });
+
+    it("rejects an over-long emoji title on the same code-point count", () => {
+      assert.throws(
+        () =>
+          validateDesiredState({
+            forums: [forumOf({ title: "👮".repeat(LIMITS.forumTitle + 1) })],
+          }),
+        /is 129 characters/,
+      );
+    });
+
+    it("names the value it rejected, so a long config is searchable", () => {
+      assert.throws(
+        () =>
+          validateDesiredState({
+            forums: [
+              forumOf({
+                topics: [
+                  { key: "t", title: "T", messages: [{ key: "m", text: text(4097) }] },
+                ],
+              }),
+            ],
+          }),
+        /text of message "a\/t\/m"/,
+      );
+    });
   });
 });

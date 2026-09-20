@@ -6,12 +6,14 @@ import { Logger, LogLevel } from "teleproto/extensions/Logger.js";
 import { FileSessionStore } from "./session-store.js";
 import {
   ForumRef,
+  GENERAL_TOPIC_ID,
   type CreatedForum,
   type CreatedTopic,
   type DialogSummary,
   type ExistingMessage,
   type ExistingTopic,
   type ForumApi,
+  type GeneralTopicState,
   type PostedMessage,
   type ResolvedForum,
 } from "./forum-types.js";
@@ -334,6 +336,29 @@ export class TelegramAccountClient implements ForumApi {
     return full.fullChat instanceof Api.ChannelFull ? full.fullChat.about : "";
   }
 
+  /**
+   * Read-only: what Telegram currently holds for the built-in General topic.
+   *
+   * Undefined means Telegram did not report it, which for a forum should not
+   * happen — the caller decides what to make of that rather than this method
+   * guessing a value the planner would then compare against.
+   */
+  async readGeneralTopic(forum: ForumRef): Promise<GeneralTopicState | undefined> {
+    const result = await this.client.invoke(
+      new Api.messages.GetForumTopicsByID({
+        peer: TelegramAccountClient.peerOf(forum),
+        topics: [GENERAL_TOPIC_ID],
+      }),
+    );
+
+    const general = result.topics.find(
+      (topic): topic is Api.ForumTopic =>
+        topic instanceof Api.ForumTopic && topic.id === GENERAL_TOPIC_ID,
+    );
+    // `hidden` is a TL flag: present means true, absent means false.
+    return general ? { hidden: general.hidden === true } : undefined;
+  }
+
   /** Read-only: which of these topics still exist, with their current titles. */
   async listExistingTopics(
     forum: ForumRef,
@@ -409,6 +434,23 @@ export class TelegramAccountClient implements ForumApi {
         peer: TelegramAccountClient.peerOf(forum),
         topicId,
         title,
+      }),
+    );
+  }
+
+  /**
+   * Hides or shows Telegram's built-in General topic.
+   *
+   * `hidden` is a flag on `messages.editForumTopic`, and Telegram accepts it
+   * only for the General topic. Nothing is created or deleted: General cannot
+   * be removed, and this project never claims to own it.
+   */
+  async setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void> {
+    await this.client.invoke(
+      new Api.messages.EditForumTopic({
+        peer: TelegramAccountClient.peerOf(forum),
+        topicId: GENERAL_TOPIC_ID,
+        hidden,
       }),
     );
   }

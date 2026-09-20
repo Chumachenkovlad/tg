@@ -4,12 +4,14 @@ import { runReconcileCommand, type ForumSession } from "../src/cli/reconcile-com
 import { DESIRED_STATE, type DesiredState } from "../src/telegram/desired-state.js";
 import {
   ForumRef,
+  GENERAL_TOPIC_ID,
   type CreatedForum,
   type CreatedTopic,
   type DialogSummary,
   type ExistingMessage,
   type ExistingTopic,
   type ForumApi,
+  type GeneralTopicState,
   type PostedMessage,
   type ResolvedForum,
 } from "../src/telegram/forum-types.js";
@@ -22,7 +24,13 @@ import {
   type ManagedStateStore,
 } from "../src/telegram/managed-state.js";
 import { MutationLockedError } from "../src/telegram/mutation-lock.js";
-import { buildPlan, countByType, hasMutations, type Plan } from "../src/telegram/planner.js";
+import {
+  buildPlan,
+  countByType,
+  hasMutations,
+  type Plan,
+  type PlannedAction,
+} from "../src/telegram/planner.js";
 import { applyPlan } from "../src/telegram/reconcile.js";
 
 /**
@@ -41,6 +49,7 @@ const FIXTURE: DesiredState = {
       key: "fixture",
       title: "Fixture forum",
       description: "fixture description",
+      hideBuiltInGeneralTopic: false,
       topics: [
         {
           key: "alpha",
@@ -69,6 +78,13 @@ interface FakeTopic {
 interface FakeForum {
   title: string;
   description: string;
+  /**
+   * Telegram's built-in General topic, which every forum has and none can
+   * delete. It is not in `topics`: the fake models it the way Telegram does,
+   * as a flag on the forum, so a test cannot accidentally create, recreate or
+   * delete it through the topic paths.
+   */
+  generalHidden: boolean;
   topics: Map<number, FakeTopic>;
 }
 
@@ -79,6 +95,8 @@ class FakeTelegram implements ForumApi {
   /** Chats this account is in but does not manage. */
   unmanagedDialogs: DialogSummary[] = [];
   failAt: { call: string; error: Error } | undefined;
+  /** Makes Telegram not report the General topic, which should not happen. */
+  generalTopicMissing = false;
 
   private nextChannelId = 2000000001;
   private nextMessageId = 100;
@@ -110,6 +128,11 @@ class FakeTelegram implements ForumApi {
     this.forums.delete(channelId);
   }
 
+  /** Unhides General behind the reconciler's back, as a person would. */
+  setGeneralHiddenByHand(channelId: string, hidden: boolean): void {
+    this.forum(channelId).generalHidden = hidden;
+  }
+
   private forum(id: string): FakeForum {
     const entry = this.forums.get(id);
     if (!entry) throw new Error(`fake: no such forum ${id}`);
@@ -138,6 +161,12 @@ class FakeTelegram implements ForumApi {
           description: entry.description,
         }
       : undefined;
+  }
+
+  async readGeneralTopic(forum: ForumRef): Promise<GeneralTopicState | undefined> {
+    this.record(`readGeneralTopic(${forum.id})`);
+    if (this.generalTopicMissing) return undefined;
+    return { hidden: this.forum(forum.id).generalHidden };
   }
 
   async listExistingTopics(
@@ -171,7 +200,8 @@ class FakeTelegram implements ForumApi {
   async createForumSupergroup(title: string, description: string): Promise<CreatedForum> {
     this.record(`createForumSupergroup(${title})`);
     const id = String(this.nextChannelId++);
-    this.forums.set(id, { title, description, topics: new Map() });
+    // Telegram shows General in a brand-new forum.
+    this.forums.set(id, { title, description, generalHidden: false, topics: new Map() });
     return { ref: new ForumRef(id, { channelId: id }), id, title };
   }
 
@@ -207,9 +237,17 @@ class FakeTelegram implements ForumApi {
 
   async setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void> {
     this.record(`setTopicTitle(${forum.id}, ${topicId}, ${title})`);
+    if (topicId === GENERAL_TOPIC_ID) {
+      throw new Error("fake: the built-in General topic must never be renamed by this project");
+    }
     const topic = this.forum(forum.id).topics.get(topicId);
     if (!topic) throw new Error(`fake: no such topic ${topicId}`);
     topic.title = title;
+  }
+
+  async setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void> {
+    this.record(`setGeneralTopicHidden(${forum.id}, ${hidden})`);
+    this.forum(forum.id).generalHidden = hidden;
   }
 
   async setMessageText(forum: ForumRef, messageId: number, text: string): Promise<void> {
@@ -247,6 +285,7 @@ const FIRST_RUN = [
 
 const CONVERGED = [
   "NOOP forum fixture",
+  "NOOP general-topic fixture/(general)",
   "NOOP topic fixture/alpha",
   "NOOP message fixture/alpha/intro",
 ];
@@ -342,6 +381,7 @@ describe("the convergence invariant", () => {
 function edited(changes: {
   forumTitle?: string;
   forumDescription?: string;
+  hideGeneral?: boolean;
   topicTitle?: string;
   messageText?: string;
 }): DesiredState {
@@ -351,6 +391,7 @@ function edited(changes: {
         key: "fixture",
         title: changes.forumTitle ?? "Fixture forum",
         description: changes.forumDescription ?? "fixture description",
+        hideBuiltInGeneralTopic: changes.hideGeneral ?? false,
         topics: [
           {
             key: "alpha",
@@ -397,10 +438,11 @@ describe("UPDATE reconciliation", () => {
 
     assert.deepEqual(planShape(plan), [
       "NOOP forum fixture",
+      "NOOP general-topic fixture/(general)",
       "NOOP topic fixture/alpha",
       "UPDATE message fixture/alpha/intro",
     ]);
-    assert.deepEqual(countByType(plan), { NOOP: 2, CREATE: 0, UPDATE: 1, DELETE: 0 });
+    assert.deepEqual(countByType(plan), { NOOP: 3, CREATE: 0, UPDATE: 1, DELETE: 0 });
   });
 
   it("plans an UPDATE and zero CREATE when the topic title changes", async () => {
@@ -410,6 +452,7 @@ describe("UPDATE reconciliation", () => {
 
     assert.deepEqual(planShape(plan), [
       "NOOP forum fixture",
+      "NOOP general-topic fixture/(general)",
       "UPDATE topic fixture/alpha",
       "NOOP message fixture/alpha/intro",
     ]);
@@ -423,6 +466,7 @@ describe("UPDATE reconciliation", () => {
 
     assert.deepEqual(planShape(plan), [
       "UPDATE forum fixture",
+      "NOOP general-topic fixture/(general)",
       "NOOP topic fixture/alpha",
       "NOOP message fixture/alpha/intro",
     ]);
@@ -434,8 +478,8 @@ describe("UPDATE reconciliation", () => {
 
     const plan = await buildPlan(edited({ messageText: "v2" }), store.load(), api);
 
-    assert.match(plan.actions[2]?.reason ?? "", /text is "first intro"/);
-    assert.match(plan.actions[2]?.reason ?? "", /should be "v2"/);
+    assert.match(plan.actions[3]?.reason ?? "", /text is "first intro"/);
+    assert.match(plan.actions[3]?.reason ?? "", /should be "v2"/);
   });
 
   it("edits the existing message id rather than sending a new message", async () => {
@@ -527,6 +571,7 @@ describe("UPDATE reconciliation", () => {
 
     assert.deepEqual(planShape(plan), [
       "NOOP forum fixture",
+      "NOOP general-topic fixture/(general)",
       "NOOP topic fixture/alpha",
       "CREATE message fixture/alpha/intro",
     ]);
@@ -569,10 +614,11 @@ describe("the state file is not the source of truth", () => {
 
     assert.deepEqual(planShape(plan), [
       "NOOP forum fixture",
+      "NOOP general-topic fixture/(general)",
       "CREATE topic fixture/alpha",
       "CREATE message fixture/alpha/intro",
     ]);
-    assert.match(plan.actions[1]?.reason ?? "", /no longer exists in Telegram/);
+    assert.match(plan.actions[2]?.reason ?? "", /no longer exists in Telegram/);
   });
 
   it("re-records the new topic id after applying, and converges again", async () => {
@@ -607,10 +653,11 @@ describe("the state file is not the source of truth", () => {
 
     assert.deepEqual(planShape(plan), [
       "NOOP forum fixture",
+      "NOOP general-topic fixture/(general)",
       "NOOP topic fixture/alpha",
       "CREATE message fixture/alpha/intro",
     ]);
-    assert.match(plan.actions[2]?.reason ?? "", /no longer exists in Telegram/);
+    assert.match(plan.actions[3]?.reason ?? "", /no longer exists in Telegram/);
   });
 
   it("detects a forum that is gone and plans the whole tree again", async () => {
@@ -651,6 +698,7 @@ describe("unmanaged entities are left alone", () => {
     api.forums.set("999000111", {
       title: "Fixture forum",
       description: "fixture description",
+      generalHidden: false,
       topics: new Map([[5, { title: "Alpha", messages: new Map([[6, "someone else's"]]) }]]),
     });
 
@@ -669,6 +717,7 @@ describe("unmanaged entities are left alone", () => {
     const unmanaged: FakeForum = {
       title: "Fixture forum",
       description: "fixture description",
+      generalHidden: false,
       topics: new Map([[5, { title: "Alpha", messages: new Map([[6, "someone else's"]]) }]]),
     };
     api.forums.set("999000111", unmanaged);
@@ -775,6 +824,7 @@ describe("a failed mutation does not claim later resources exist", () => {
 
     assert.deepEqual(planShape(retry), [
       "NOOP forum fixture",
+      "NOOP general-topic fixture/(general)",
       "CREATE topic fixture/alpha",
       "CREATE message fixture/alpha/intro",
     ]);
@@ -1177,6 +1227,188 @@ describe("the recorded state survives a round trip", () => {
  * configuration this repository actually ships reconciles cleanly, converges,
  * and never touches the network while doing so.
  */
+/**
+ * Telegram's built-in General topic.
+ *
+ * It always exists, it cannot be deleted, and it is not ours. The point of
+ * every test here is that reconciling it never turns into owning it: no
+ * create, no recorded id, no rename, no delete.
+ */
+describe("the built-in General topic", () => {
+  /** The fixture, with General reconciled to `hidden`. */
+  const wanting = (hidden: boolean): DesiredState => edited({ hideGeneral: hidden });
+
+  /** Applies `desired` from scratch and hands back what it produced. */
+  async function applied(desired: DesiredState): Promise<{
+    api: FakeTelegram;
+    store: MemoryManagedStateStore;
+    forumId: string;
+  }> {
+    const api = new FakeTelegram();
+    const store = new MemoryManagedStateStore();
+    await reconcile(api, store, desired);
+    return { api, store, forumId: store.load().forums.fixture?.id as string };
+  }
+
+  it("hides it on the first apply, alongside the managed topics", async () => {
+    const { api, forumId } = await applied(wanting(true));
+
+    assert.equal(api.forums.get(forumId)?.generalHidden, true);
+    assert.ok(
+      api.mutations.includes(`setGeneralTopicHidden(${forumId}, true)`),
+      "the first apply must hide General",
+    );
+    assert.ok(
+      api.mutations.includes("createForumTopic(2000000001, Alpha)"),
+      "and must still create our own topics",
+    );
+  });
+
+  it("plans it as an UPDATE, never a CREATE — Telegram already made it", async () => {
+    const api = new FakeTelegram();
+
+    const plan = await buildPlan(wanting(true), emptyState(), api);
+
+    const general = plan.actions.filter((action) => action.resource === "general-topic");
+    assert.equal(general.length, 1);
+    assert.equal(general[0]?.type, "UPDATE");
+  });
+
+  it("cannot even be expressed as a CREATE action", () => {
+    // A compile-time proof rather than a runtime check: `general-topic` is
+    // not among the resources a CREATE action can carry, so no code path can
+    // plan one. Give CREATE that resource and this stops compiling.
+    type CreatableResource = Extract<PlannedAction, { type: "CREATE" }>["resource"];
+    const notCreatable: Exclude<"general-topic", CreatableResource> = "general-topic";
+
+    assert.equal(notCreatable, "general-topic");
+  });
+
+  it("is NOOP on an unchanged second plan", async () => {
+    const { api, store } = await applied(wanting(true));
+
+    const plan = await buildPlan(wanting(true), store.load(), api);
+
+    assert.equal(hasMutations(plan), false);
+    const general = plan.actions.find((action) => action.resource === "general-topic");
+    assert.equal(general?.type, "NOOP");
+    assert.match(general?.reason ?? "", /already hidden/);
+  });
+
+  it("hides it again when someone unhides it by hand", async () => {
+    const { api, store, forumId } = await applied(wanting(true));
+    api.setGeneralHiddenByHand(forumId, false);
+    const before = api.mutations.length;
+
+    const plan = await buildPlan(wanting(true), store.load(), api);
+    assert.deepEqual(
+      plan.actions.filter((action) => action.resource === "general-topic").map((a) => a.type),
+      ["UPDATE"],
+    );
+    assert.match(
+      plan.actions.find((action) => action.resource === "general-topic")?.reason ?? "",
+      /is visible, should be hidden/,
+    );
+
+    await applyPlan(plan, api, store);
+
+    assert.equal(api.forums.get(forumId)?.generalHidden, true, "it must be hidden again");
+    assert.deepEqual(api.mutations.slice(before), [`setGeneralTopicHidden(${forumId}, true)`]);
+  });
+
+  it("shows it again when the configuration says it should be visible", async () => {
+    const { api, store, forumId } = await applied(wanting(true));
+
+    await reconcile(api, store, wanting(false));
+
+    assert.equal(api.forums.get(forumId)?.generalHidden, false);
+  });
+
+  it("does nothing at all when a new forum's General should stay visible", async () => {
+    const { api, forumId } = await applied(wanting(false));
+
+    assert.equal(api.forums.get(forumId)?.generalHidden, false);
+    assert.ok(
+      !api.mutations.some((call) => call.startsWith("setGeneralTopicHidden")),
+      "Telegram already shows General in a new forum — there is nothing to do",
+    );
+  });
+
+  it("never records id 1 in the managed state", async () => {
+    const { store } = await applied(wanting(true));
+
+    const recorded = store.load().forums.fixture;
+    assert.ok(recorded);
+    const topicIds = Object.values(recorded.topics).map((topic) => topic.topicId);
+    assert.ok(
+      !topicIds.includes(GENERAL_TOPIC_ID),
+      "General is not ours, so its id must never appear in the mapping",
+    );
+    assert.deepEqual(Object.keys(recorded.topics), ["alpha"], "only our own topics are recorded");
+  });
+
+  it("never creates, renames or deletes it", async () => {
+    const { api, forumId } = await applied(wanting(true));
+    // The fake throws on a rename of id 1, so reaching that call would fail
+    // the test loudly rather than silently pass.
+    const touching = api.calls.filter((call) => call.includes(`, ${GENERAL_TOPIC_ID},`));
+
+    assert.deepEqual(touching, [], "no call may address General as an ordinary topic");
+    assert.ok(!api.mutations.some((call) => call.startsWith("createForumTopic") && call.endsWith(", General)")));
+    assert.equal(api.forums.get(forumId)?.topics.has(GENERAL_TOPIC_ID), false);
+  });
+
+  it("is read separately from the topics whose ids we recorded", async () => {
+    const { api, store } = await applied(wanting(true));
+    api.calls.length = 0;
+
+    await buildPlan(wanting(true), store.load(), api);
+
+    const askedAbout = api.calls
+      .filter((call) => call.startsWith("listExistingTopics"))
+      .flatMap((call) => (call.match(/\[(.*)\]/u)?.[1] ?? "").split(",").filter(Boolean))
+      .map(Number);
+    assert.ok(askedAbout.length > 0, "the recorded topic must still be checked");
+    assert.ok(
+      !askedAbout.includes(GENERAL_TOPIC_ID),
+      "General must not be mixed into the recorded-topic existence check",
+    );
+    assert.equal(api.calls.filter((call) => call.startsWith("readGeneralTopic")).length, 1);
+  });
+
+  it("sets it rather than guessing when Telegram does not report it", async () => {
+    const { api, store } = await applied(wanting(true));
+    api.generalTopicMissing = true;
+
+    const plan = await buildPlan(wanting(true), store.load(), api);
+
+    const general = plan.actions.find((action) => action.resource === "general-topic");
+    assert.equal(general?.type, "UPDATE");
+    assert.match(general?.reason ?? "", /did not report the built-in General topic/);
+  });
+
+  it("writes no state for it, because it owns no id", async () => {
+    const { api, store, forumId } = await applied(wanting(true));
+    api.setGeneralHiddenByHand(forumId, false);
+    const before = JSON.stringify(store.load());
+    let writes = 0;
+    const counting: ManagedStateStore = {
+      load: () => store.load(),
+      ensureWritable: () => store.ensureWritable(),
+      save: (state) => {
+        writes += 1;
+        store.save(state);
+      },
+      describe: () => store.describe(),
+    };
+
+    await applyPlan(await buildPlan(wanting(true), store.load(), api), api, counting);
+
+    assert.equal(writes, 0);
+    assert.equal(JSON.stringify(store.load()), before);
+  });
+});
+
 describe("the real TSC 8042 configuration", () => {
   const TSC8042 = DESIRED_STATE.forums[0] as NonNullable<(typeof DESIRED_STATE.forums)[0]>;
 
@@ -1211,14 +1443,18 @@ describe("the real TSC 8042 configuration", () => {
 
     const plan = await reconcile(api, store, DESIRED_STATE);
 
-    const expected = 1 + TSC8042.topics.length * 2;
-    assert.equal(countByType(plan).CREATE, expected);
-    assert.equal(api.mutations.length, expected);
+    const creates = 1 + TSC8042.topics.length * 2;
+    assert.equal(countByType(plan).CREATE, creates);
+    // The creates, plus hiding the built-in General topic — which is an
+    // UPDATE, because Telegram already made that topic with the forum.
+    assert.equal(countByType(plan).UPDATE, 1);
+    assert.equal(api.mutations.length, creates + 1);
     assert.equal(api.forums.size, 1);
 
     const [forum] = [...api.forums.values()];
     assert.equal(forum?.title, TSC8042.title);
     assert.equal(forum?.description, TSC8042.description);
+    assert.equal(forum?.generalHidden, true, "the built-in General topic must end up hidden");
     assert.equal(forum?.topics.size, TSC8042.topics.length);
     for (const topic of forum?.topics.values() ?? []) {
       assert.equal(topic.messages.size, 1, `"${topic.title}" must carry exactly one intro`);

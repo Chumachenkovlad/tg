@@ -154,6 +154,37 @@ and one managed `intro` message in each:
 The group is private: `channels.createChannel` is called without a username,
 so nothing is public, and no user is ever invited or added by this project.
 
+#### Telegram's built-in General topic
+
+Every forum Telegram creates carries a **General** topic, always id `1`, which
+cannot be deleted. It is not one of the topics above and it is **not** this
+project's to own: it is never created, never renamed, never recorded in
+`telegram/managed-state.json`, and there is no code path that could delete it —
+`general-topic` is a resource of its own in the action union, and the union
+has no `CREATE` for it, which a test asserts at compile time.
+
+The one thing reconciled about it is whether it is hidden:
+
+```ts
+hideBuiltInGeneralTopic: true
+```
+
+Navigation here runs through the managed topics, and `general`
+("💬 Загальні питання") is the one people are pointed at for loose questions,
+so the built-in one is hidden to keep the topic list unambiguous. It is
+reconciled in both directions — unhide it by hand in the Telegram app and the
+next plan offers to hide it again:
+
+```
+  UPDATE general-topic tsc8042/(general)  (built-in General topic is visible, should be hidden)
+```
+
+The path is parenthesised so it cannot collide with a managed topic key and
+reads at a glance as something that is not ours. Hiding is
+`messages.editForumTopic` with the `hidden` flag on topic `1` — Telegram
+accepts that flag only for General. Hiding is not closing, and this PR adds no
+pinning, topic closing, permissions, invite links or anti-spam automation.
+
 Topic order in the file is the order they are created in on a first apply. It
 is not enforced afterwards — Telegram sorts a forum's topic list by activity,
 and nothing here reorders topics.
@@ -363,6 +394,10 @@ A forum `UPDATE` names the single attribute it changes (`title` or
 `description`), because each one is a different Telegram method. A topic or
 message `UPDATE` has only one attribute to change.
 
+`general-topic` only ever produces `NOOP` or `UPDATE`. Telegram made that
+topic when it made the forum, so there is nothing to create, and the union
+carries no `CREATE` for it.
+
 A resource dropped from the desired state is **not** planned for deletion, and
 a chat the state does not record as managed is never looked at — not even one
 that happens to carry the configured title. Destructive reconciliation
@@ -375,6 +410,7 @@ that happens to carry the configured title. Destructive reconciliation
 | inspection | `client.getDialogs()` (read-only) |
 | resolve a recorded forum + its title | `client.getDialogs()` (read-only) |
 | its current description | `channels.getFullChannel` (read-only, only for the forum that matched) |
+| is the built-in General topic hidden | `messages.getForumTopicsByID` on topic `1` (read-only) |
 | do these topics exist, and their titles | `messages.getForumTopicsByID` (read-only) |
 | do these messages exist, and their text | `channels.getMessages` (read-only) |
 | create forum | `channels.createChannel` with `megagroup: true, forum: true` and `about` |
@@ -383,6 +419,7 @@ that happens to carry the configured title. Destructive reconciliation
 | rename forum | `channels.editTitle` |
 | rewrite the forum description | `messages.editChatAbout` |
 | rename topic | `messages.editForumTopic` |
+| hide/show the built-in General topic | `messages.editForumTopic` with `hidden` on topic `1` |
 | edit message | `messages.editMessage` |
 
 The description goes out with `channels.createChannel` rather than as a
@@ -441,6 +478,25 @@ calls `sendMessageToTopic(forum, topicId, text)`.
   could not be saved, zero Telegram mutations are attempted: a forum created
   against a read-only checkout would exist with nothing owning it, and the
   next run would build a second one.
+- **The configuration is validated before the first mutating call.** The
+  planner runs `validateDesiredState` up front, so a configuration Telegram
+  would refuse is not applied *partially*: duplicate or empty keys, blank
+  titles and message bodies, and anything past Telegram's length limits stop
+  the run before a single resource is created.
+
+  | Value | Limit |
+  | --- | --- |
+  | forum title | 128 |
+  | topic title | 128 |
+  | forum description | 255 |
+  | managed message | 4096 |
+
+  Counted in **code points**, not UTF-16 units — `"👮".length` is 2 but
+  Telegram counts it once, so counting the wrong one would reject a title
+  Telegram accepts. Exactly at the limit passes; one character over does not.
+  The error names the offending value by its logical path
+  (`text of message "tsc8042/rules/intro"`), so it is searchable in a long
+  configuration.
 - **Unknown flags are rejected** with exit code 2. A typo like `--yse` is an
   error, never a silent fall-through to the default. `telegram:plan` rejects
   `--yes` outright: it has nothing to confirm.
@@ -541,9 +597,20 @@ slugs carrying no emoji or display wording, non-empty and distinct titles,
 exactly one `intro` per topic with unique message keys, text that is non-empty,
 Ukrainian and inside Telegram's 4096-character limit, and no leftover of the
 old test forum. `test/reconcile.test.ts` then drives the real configuration end
-to end: 29 creates, convergence on the second run, a reworded title,
-description and intro reconciling as four in-place `UPDATE`s that move no id,
-and a description-only change sending nothing but `setForumDescription`.
+to end: 29 creates plus hiding the built-in General topic, convergence on the
+second run, a reworded title, description and intro reconciling as four
+in-place `UPDATE`s that move no id, and a description-only change sending
+nothing but `setForumDescription`.
+
+The built-in General topic has its own block: hidden on the first apply
+alongside the managed topics, `NOOP` on an unchanged second plan, hidden again
+after someone unhides it by hand, shown again when the configuration asks for
+it, id `1` never appearing in the mapping, never mixed into the recorded-topic
+existence check, no state written for it, and a compile-time assertion that no
+`CREATE` action can carry that resource at all. Length validation is covered
+at the boundary — exactly at the limit and one code point over, for each of
+the four limits, including an emoji title whose UTF-16 length would wrongly
+fail.
 
 For reconciliation they also cover: a first run planning three creates; a second
 run against the applied state planning zero mutations, repeatedly and with no

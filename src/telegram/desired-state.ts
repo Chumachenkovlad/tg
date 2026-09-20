@@ -37,6 +37,16 @@ export interface DesiredForum {
    * and edited in place afterwards when this text changes.
    */
   description: string;
+  /**
+   * Whether Telegram's built-in "General" topic is hidden.
+   *
+   * Every forum has one and it cannot be deleted, so this is the only thing
+   * there is to decide about it. It is **not** one of `topics`: it is not
+   * created here, never recorded in the managed state, and never treated as
+   * content this project owns. Reconciled both ways — unhide it by hand and
+   * the next plan offers to hide it again.
+   */
+  hideBuiltInGeneralTopic: boolean;
   topics: DesiredTopic[];
 }
 
@@ -50,12 +60,35 @@ export const DESIRED_STATE: DesiredState = {
 };
 
 /**
- * Rejects a configuration that cannot be reconciled unambiguously.
+ * What Telegram accepts, in **code points**.
+ *
+ * Telegram counts characters, not UTF-8 bytes, and emoji and Cyrillic are
+ * exactly as expensive as ASCII — so every check below counts `[...value]`
+ * rather than `value.length`, which would count a non-BMP emoji twice and
+ * reject a title Telegram would have taken.
+ */
+export const LIMITS = {
+  forumTitle: 128,
+  topicTitle: 128,
+  forumDescription: 255,
+  messageText: 4096,
+} as const;
+
+/** Code points, not UTF-16 units: `"👮".length` is 2, this returns 1. */
+export function characterCount(value: string): number {
+  return [...value].length;
+}
+
+/**
+ * Rejects a configuration that cannot be reconciled unambiguously, or that
+ * Telegram would refuse.
  *
  * Duplicate keys would make two different resources share one slot in the
  * state file, which is exactly how duplicates in Telegram get created. Blank
- * titles and blank message bodies are rejected here rather than by Telegram,
- * halfway through an apply that has already created things.
+ * or over-long titles and message bodies are rejected here rather than by
+ * Telegram, halfway through an apply that has already created things: the
+ * planner runs this before the first mutating call, so a configuration that
+ * cannot be applied fully is not applied at all.
  */
 export function validateDesiredState(desired: DesiredState): void {
   assertUniqueKeys(
@@ -65,18 +98,31 @@ export function validateDesiredState(desired: DesiredState): void {
 
   for (const forum of desired.forums) {
     assertNonEmpty(forum.title, `title of forum "${forum.key}"`);
+    assertWithinLimit(forum.title, LIMITS.forumTitle, `title of forum "${forum.key}"`);
+    assertWithinLimit(
+      forum.description,
+      LIMITS.forumDescription,
+      `description of forum "${forum.key}"`,
+    );
     assertUniqueKeys(
       forum.topics.map((topic) => topic.key),
       `topic in forum "${forum.key}"`,
     );
     for (const topic of forum.topics) {
-      assertNonEmpty(topic.title, `title of topic "${forum.key}/${topic.key}"`);
+      const topicPath = `${forum.key}/${topic.key}`;
+      assertNonEmpty(topic.title, `title of topic "${topicPath}"`);
+      assertWithinLimit(topic.title, LIMITS.topicTitle, `title of topic "${topicPath}"`);
       assertUniqueKeys(
         topic.messages.map((message) => message.key),
-        `message in topic "${forum.key}/${topic.key}"`,
+        `message in topic "${topicPath}"`,
       );
       for (const message of topic.messages) {
-        assertNonEmpty(message.text, `text of message "${forum.key}/${topic.key}/${message.key}"`);
+        assertNonEmpty(message.text, `text of message "${topicPath}/${message.key}"`);
+        assertWithinLimit(
+          message.text,
+          LIMITS.messageText,
+          `text of message "${topicPath}/${message.key}"`,
+        );
       }
     }
   }
@@ -94,4 +140,15 @@ function assertUniqueKeys(keys: readonly string[], what: string): void {
 /** A description may be empty; a title or a message body may not. */
 function assertNonEmpty(value: string, what: string): void {
   if (value.trim() === "") throw new Error(`Empty ${what} in the desired state.`);
+}
+
+/** Exactly at the limit is fine; one code point past it is not. */
+function assertWithinLimit(value: string, limit: number, what: string): void {
+  const length = characterCount(value);
+  if (length > limit) {
+    throw new Error(
+      `The ${what} is ${length} characters, over Telegram's limit of ${limit}. ` +
+        `Shorten it in the desired state.`,
+    );
+  }
 }

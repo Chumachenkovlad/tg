@@ -136,6 +136,18 @@ export async function applyPlan(
             break;
           }
 
+          // Not a resource this project owns: General always exists, is
+          // never created and is never recorded, so this flips a flag and
+          // writes nothing to the mapping.
+          case "general-topic": {
+            step(`UPDATE ${action.path} → ${action.hidden ? "hidden" : "visible"}`);
+            await api.setGeneralTopicHidden(
+              forumRef(forums, action.forumKey),
+              action.hidden,
+            );
+            break;
+          }
+
           case "topic": {
             step(`UPDATE topic ${action.path} → "${action.title}"`);
             await api.setTopicTitle(

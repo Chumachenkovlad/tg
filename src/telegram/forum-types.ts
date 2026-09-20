@@ -83,6 +83,22 @@ export interface ResolvedForum {
   description: string;
 }
 
+/**
+ * Telegram's built-in "General" topic.
+ *
+ * Every forum has one, it is always this id, and it cannot be deleted. It is
+ * therefore never created by this project and never recorded in the managed
+ * state: it is not ours, it merely exists, and the only thing reconciled
+ * about it is whether it is hidden.
+ */
+export const GENERAL_TOPIC_ID = 1;
+
+/** What Telegram currently holds for the built-in General topic. */
+export interface GeneralTopicState {
+  /** True when the topic is hidden from the forum's topic list. */
+  hidden: boolean;
+}
+
 /** A topic found alive in Telegram, with the title it currently has. */
 export interface ExistingTopic {
   id: number;
@@ -130,6 +146,15 @@ export interface ForumApi {
    * than against anything it remembered.
    */
   findForumById(id: string): Promise<ResolvedForum | undefined>;
+  /**
+   * Read-only: the current state of the built-in General topic, or undefined
+   * when Telegram does not report it.
+   *
+   * Deliberately separate from {@link listExistingTopics}: General is not one
+   * of the topics this project owns, and must not be mixed into the list of
+   * recorded ids that drives creation and recreation.
+   */
+  readGeneralTopic(forum: ForumRef): Promise<GeneralTopicState | undefined>;
   /** Read-only: which of these topics still exist, and their current titles. */
   listExistingTopics(forum: ForumRef, topicIds: readonly number[]): Promise<ExistingTopic[]>;
   /** Read-only: which of these messages still exist, and their current text. */
@@ -156,6 +181,11 @@ export interface ForumApi {
   setForumDescription(forum: ForumRef, description: string): Promise<void>;
   /** Renames a topic in place. Its topic id does not change. */
   setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void>;
+  /**
+   * Hides or shows the built-in General topic. Nothing is created or deleted:
+   * `hidden` is a flag on a topic that always exists.
+   */
+  setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void>;
   /** Edits a message's text in place. Its message id does not change. */
   setMessageText(forum: ForumRef, messageId: number, text: string): Promise<void>;
 }
