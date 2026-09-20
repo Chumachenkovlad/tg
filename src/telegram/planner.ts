@@ -37,6 +37,8 @@ export interface CreateForumAction extends BaseAction {
   resource: "forum";
   forumKey: string;
   title: string;
+  /** Set by the creating call itself, not by a follow-up edit. */
+  description: string;
 }
 
 export interface CreateTopicAction extends BaseAction {
@@ -56,12 +58,19 @@ export interface CreateMessageAction extends BaseAction {
   text: string;
 }
 
-/** Renames a forum in place. The recorded channel id is unaffected. */
+/**
+ * Changes one forum attribute in place. The recorded channel id is unaffected.
+ *
+ * A forum has more than one editable attribute, and each is a separate
+ * Telegram method — so there is one action per attribute that actually
+ * differs. Editing the description alone therefore sends no rename.
+ */
 export interface UpdateForumAction extends BaseAction {
   type: "UPDATE";
   resource: "forum";
   forumKey: string;
-  title: string;
+  field: "title" | "description";
+  value: string;
 }
 
 /** Renames a topic in place. The recorded topic id is unaffected. */
@@ -176,6 +185,7 @@ async function planForum(
       path: forum.key,
       forumKey: forum.key,
       title: forum.title,
+      description: forum.description,
       reason: recorded
         ? `recorded forum ${recorded.id} no longer exists in Telegram`
         : "not created yet",
@@ -190,25 +200,35 @@ async function planForum(
 
   resolvedForums.set(forum.key, resolved.ref);
 
-  // The forum is this one whatever it is called now: a changed title is an
-  // edit of it, never a second group.
-  actions.push(
-    resolved.title === forum.title
-      ? {
-          type: "NOOP",
-          resource: "forum",
-          path: forum.key,
-          reason: `exists as ${recorded.id}, title matches`,
-        }
-      : {
-          type: "UPDATE",
-          resource: "forum",
-          path: forum.key,
-          forumKey: forum.key,
-          title: forum.title,
-          reason: `title is ${quote(resolved.title)}, should be ${quote(forum.title)}`,
-        },
-  );
+  // The forum is this one whatever it is called now: a changed title or
+  // description is an edit of it, never a second group.
+  const changed = ([
+    { field: "title", current: resolved.title, desired: forum.title },
+    { field: "description", current: resolved.description, desired: forum.description },
+  ] as const).filter((attribute) => attribute.current !== attribute.desired);
+
+  if (changed.length === 0) {
+    actions.push({
+      type: "NOOP",
+      resource: "forum",
+      path: forum.key,
+      reason: `exists as ${recorded.id}, title and description match`,
+    });
+  } else {
+    for (const attribute of changed) {
+      actions.push({
+        type: "UPDATE",
+        resource: "forum",
+        path: forum.key,
+        forumKey: forum.key,
+        field: attribute.field,
+        value: attribute.desired,
+        reason:
+          `${attribute.field} is ${quote(attribute.current)}, ` +
+          `should be ${quote(attribute.desired)}`,
+      });
+    }
+  }
 
   // Two round-trips for the whole forum, not one per topic and message.
   const recordedTopics = forum.topics

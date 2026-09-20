@@ -240,6 +240,36 @@ const FORUM = new ForumRef("2000000042", {
   accessHash: bigInt(99),
 });
 
+/** The same channel as Telegram would hand it back in the chat list. */
+const MANAGED_CHANNEL = new Api.Channel({
+  id: bigInt(2000000042),
+  accessHash: bigInt(99),
+  title: "ТСЦ 8042 — практичний іспит",
+  photo: new Api.ChatPhotoEmpty(),
+  date: 0,
+  megagroup: true,
+  forum: true,
+});
+
+/** A `channels.getFullChannel` answer carrying the given "about" text. */
+function fullChannel(about: string): Api.messages.ChatFull {
+  return new Api.messages.ChatFull({
+    fullChat: new Api.ChannelFull({
+      id: bigInt(2000000042),
+      about,
+      readInboxMaxId: 0,
+      readOutboxMaxId: 0,
+      unreadCount: 0,
+      chatPhoto: new Api.PhotoEmpty({ id: bigInt(0) }),
+      notifySettings: new Api.PeerNotifySettings({}),
+      botInfo: [],
+      pts: 0,
+    }),
+    chats: [],
+    users: [],
+  });
+}
+
 describe("TelegramAccountClient.sendMessageToTopic", () => {
   const forum = FORUM;
 
@@ -321,7 +351,7 @@ describe("TelegramAccountClient.sendMessageToTopic", () => {
 });
 
 describe("TelegramAccountClient.createForumSupergroup", () => {
-  it("asks for a megagroup with forum topics enabled", async () => {
+  it("asks for a megagroup with forum topics enabled, carrying the description", async () => {
     const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
     let captured: Api.AnyRequest | undefined;
     const internals = client as unknown as {
@@ -348,13 +378,18 @@ describe("TelegramAccountClient.createForumSupergroup", () => {
       });
     };
 
-    const created = await client.createForumSupergroup("TSC 8042 Test");
+    const created = await client.createForumSupergroup("TSC 8042 Test", "Спільнота 8042");
 
     const request = captured as unknown as Api.channels.CreateChannel;
     assert.equal(request.megagroup, true);
     assert.equal(request.forum, true);
     assert.equal(request.broadcast, undefined, "a broadcast channel cannot hold topics");
     assert.equal(request.title, "TSC 8042 Test");
+    assert.equal(
+      request.about,
+      "Спільнота 8042",
+      "the description must go out with the creating call, not as a follow-up edit",
+    );
     assert.equal(created.id, "2000000042");
     assert.ok(!String(created.ref).includes("99"), "the access hash must not be printable");
   });
@@ -373,19 +408,28 @@ describe("TelegramAccountClient.createForumSupergroup", () => {
  *   channels.createChannel      (no peer parameter)
  *   channels.getMessages        channel:InputChannel
  *   channels.editTitle          channel:InputChannel
+ *   channels.getFullChannel     channel:InputChannel
  *   messages.createForumTopic   peer:InputPeer
  *   messages.sendMessage        peer:InputPeer
  *   messages.editMessage        peer:InputPeer
  *   messages.editForumTopic     peer:InputPeer
  *   messages.getForumTopicsByID peer:InputPeer
+ *   messages.editChatAbout      peer:InputPeer
  */
 describe("TL parameter types", () => {
   /** Captures every request, answering each with something plausible. */
   function recorder(client: TelegramAccountClient): { requests: Api.AnyRequest[] } {
     const requests: Api.AnyRequest[] = [];
     const internals = client as unknown as {
-      client: { invoke: (request: Api.AnyRequest) => Promise<unknown> };
+      client: {
+        invoke: (request: Api.AnyRequest) => Promise<unknown>;
+        getDialogs: () => Promise<unknown[]>;
+      };
     };
+    // findForumById reads the chat list through the library's own helper
+    // rather than a raw request, so it is stubbed separately. No connection
+    // is opened either way.
+    internals.client.getDialogs = async () => [{ entity: MANAGED_CHANNEL }];
     internals.client.invoke = async (request) => {
       requests.push(request);
       if (request instanceof Api.messages.GetForumTopicsByID) {
@@ -408,6 +452,9 @@ describe("TL parameter types", () => {
           users: [],
         });
       }
+      if (request instanceof Api.channels.GetFullChannel) {
+        return fullChannel("the description Telegram holds");
+      }
       return new Api.Updates({
         updates: [new Api.UpdateMessageID({ id: 7, randomId: bigInt(1) })],
         users: [],
@@ -427,10 +474,12 @@ describe("TL parameter types", () => {
     await client.createForumTopic(FORUM, "t");
     await client.sendMessageToTopic(FORUM, 1, "m");
     await client.setForumTitle(FORUM, "t");
+    await client.setForumDescription(FORUM, "d");
     await client.setTopicTitle(FORUM, 1, "t");
     await client.setMessageText(FORUM, 1, "m");
     await client.listExistingTopics(FORUM, [1]);
     await client.listExistingMessages(FORUM, [1]);
+    await client.findForumById("2000000042");
 
     return recorded.requests;
   }
@@ -450,6 +499,7 @@ describe("TL parameter types", () => {
     for (const [name, request] of [
       ["channels.getMessages", find(requests, Api.channels.GetMessages).channel],
       ["channels.editTitle", find(requests, Api.channels.EditTitle).channel],
+      ["channels.getFullChannel", find(requests, Api.channels.GetFullChannel).channel],
     ] as const) {
       assert.ok(
         request instanceof Api.InputChannel,
@@ -471,6 +521,7 @@ describe("TL parameter types", () => {
       ["messages.editMessage", find(requests, Api.messages.EditMessage).peer],
       ["messages.editForumTopic", find(requests, Api.messages.EditForumTopic).peer],
       ["messages.getForumTopicsByID", find(requests, Api.messages.GetForumTopicsByID).peer],
+      ["messages.editChatAbout", find(requests, Api.messages.EditChatAbout).peer],
     ] as const) {
       assert.ok(
         peer instanceof Api.InputPeerChannel,
@@ -489,6 +540,29 @@ describe("TL parameter types", () => {
     assert.equal(channel.channelId.toString(), "2000000042");
     assert.equal(peer.channelId.toString(), "2000000042");
     assert.equal(channel.accessHash.toString(), peer.accessHash.toString());
+  });
+
+  it("reads the description back, so the planner compares against Telegram", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    recorder(client);
+
+    const resolved = await client.findForumById("2000000042");
+
+    assert.ok(resolved, "the recorded forum must resolve");
+    assert.equal(resolved.title, "ТСЦ 8042 — практичний іспит");
+    assert.equal(resolved.description, "the description Telegram holds");
+  });
+
+  it("asks for the description only for the forum that matched", async () => {
+    const client = TelegramAccountClient.fromConfig(CONFIG, new FakeStore(""));
+    const recorded = recorder(client);
+
+    await client.findForumById("9999999999");
+
+    assert.ok(
+      !recorded.requests.some((request) => request instanceof Api.channels.GetFullChannel),
+      "a forum that is not in the chat list must cost no extra round-trip",
+    );
   });
 
   it("rejects a reference that is not one of ours", async () => {

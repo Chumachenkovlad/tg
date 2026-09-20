@@ -200,12 +200,16 @@ export class TelegramAccountClient implements ForumApi {
    *
    * Private is the default: no username is requested, so the group is not
    * public and nobody is invited. Nothing else on the account is touched.
+   *
+   * The description goes out with this same call rather than as a follow-up
+   * edit: a second request could fail, leaving a created group carrying no
+   * description until the next apply.
    */
-  async createForumSupergroup(title: string): Promise<CreatedForum> {
+  async createForumSupergroup(title: string, description: string): Promise<CreatedForum> {
     const updates = await this.client.invoke(
       new Api.channels.CreateChannel({
         title,
-        about: "",
+        about: description,
         megagroup: true,
         forum: true,
       }),
@@ -289,6 +293,11 @@ export class TelegramAccountClient implements ForumApi {
    * The access hash is not persisted anywhere, so it is recovered here from
    * the chat list. That doubles as the existence check: a forum that was
    * deleted, or that this account has left, simply is not in the list.
+   *
+   * The description is not in the chat list — only the full channel carries
+   * it — so one extra read follows for the forum that matched. It is the
+   * only way the planner can tell a description that already matches from
+   * one that needs editing.
    */
   async findForumById(id: string): Promise<ResolvedForum | undefined> {
     const dialogs = await this.client.getDialogs();
@@ -302,13 +311,27 @@ export class TelegramAccountClient implements ForumApi {
       // gone rather than trying to put topics into it.
       if (!entity.forum) continue;
 
+      const ref = TelegramAccountClient.refFor(entity.id, entity.accessHash);
       return {
-        ref: TelegramAccountClient.refFor(entity.id, entity.accessHash),
+        ref,
         title: entity.title,
+        description: await this.readForumDescription(ref),
       };
     }
 
     return undefined;
+  }
+
+  /** Read-only: the group's current "about" text, or "" when it has none. */
+  private async readForumDescription(forum: ForumRef): Promise<string> {
+    const full = await this.client.invoke(
+      // channels.getFullChannel takes `channel:InputChannel`, not an InputPeer.
+      new Api.channels.GetFullChannel({ channel: TelegramAccountClient.channelOf(forum) }),
+    );
+
+    // Only a ChannelFull carries `about`; anything else means no description
+    // this planner could compare against.
+    return full.fullChat instanceof Api.ChannelFull ? full.fullChat.about : "";
   }
 
   /** Read-only: which of these topics still exist, with their current titles. */
@@ -361,6 +384,21 @@ export class TelegramAccountClient implements ForumApi {
     await this.client.invoke(
       // channels.editTitle takes `channel:InputChannel`, not an InputPeer.
       new Api.channels.EditTitle({ channel: TelegramAccountClient.channelOf(forum), title }),
+    );
+  }
+
+  /**
+   * Rewrites the forum's description in place. The channel id does not change.
+   *
+   * `messages.editChatAbout` is the method for both chats and channels — there
+   * is no `channels.editAbout` — so this one takes `peer:InputPeer`.
+   */
+  async setForumDescription(forum: ForumRef, description: string): Promise<void> {
+    await this.client.invoke(
+      new Api.messages.EditChatAbout({
+        peer: TelegramAccountClient.peerOf(forum),
+        about: description,
+      }),
     );
   }
 

@@ -73,12 +73,14 @@ export interface CreatedForum {
 /**
  * A forum recorded in local state, found alive in Telegram.
  *
- * Carries the title Telegram currently holds, which is what the planner
- * compares the desired title against.
+ * Carries the title and description Telegram currently holds, which is what
+ * the planner compares the desired ones against.
  */
 export interface ResolvedForum {
   ref: ForumRef;
   title: string;
+  /** The group's "about" text. Empty when it has none. */
+  description: string;
 }
 
 /** A topic found alive in Telegram, with the title it currently has. */
@@ -136,8 +138,13 @@ export interface ForumApi {
     messageIds: readonly number[],
   ): Promise<ExistingMessage[]>;
 
-  /** Creates a private supergroup with forum topics enabled. */
-  createForumSupergroup(title: string): Promise<CreatedForum>;
+  /**
+   * Creates a private supergroup with forum topics enabled.
+   *
+   * The description is set by the same call, so a freshly created forum is
+   * never briefly public-facing with the wrong "about" text.
+   */
+  createForumSupergroup(title: string, description: string): Promise<CreatedForum>;
   /** Creates one topic in a forum. */
   createForumTopic(forum: ForumRef, title: string): Promise<CreatedTopic>;
   /** Sends one top-level message into a specific forum topic. */
@@ -145,6 +152,8 @@ export interface ForumApi {
 
   /** Renames a forum in place. Its channel id does not change. */
   setForumTitle(forum: ForumRef, title: string): Promise<void>;
+  /** Rewrites a forum's description in place. Its channel id does not change. */
+  setForumDescription(forum: ForumRef, description: string): Promise<void>;
   /** Renames a topic in place. Its topic id does not change. */
   setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void>;
   /** Edits a message's text in place. Its message id does not change. */

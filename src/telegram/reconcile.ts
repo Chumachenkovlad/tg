@@ -81,7 +81,7 @@ export async function applyPlan(
         switch (action.resource) {
           case "forum": {
             step(`CREATE forum ${action.path} ("${action.title}")`);
-            const created = await api.createForumSupergroup(action.title);
+            const created = await api.createForumSupergroup(action.title, action.description);
             forums.set(action.forumKey, created.ref);
             state = recordForum(state, action.forumKey, created.id);
             break;
@@ -129,8 +129,10 @@ export async function applyPlan(
         // none of them changes the mapping.
         switch (action.resource) {
           case "forum": {
-            step(`UPDATE forum ${action.path} → "${action.title}"`);
-            await api.setForumTitle(forumRef(forums, action.forumKey), action.title);
+            step(`UPDATE forum ${action.path} ${action.field}`);
+            const ref = forumRef(forums, action.forumKey);
+            if (action.field === "title") await api.setForumTitle(ref, action.value);
+            else await api.setForumDescription(ref, action.value);
             break;
           }
 
