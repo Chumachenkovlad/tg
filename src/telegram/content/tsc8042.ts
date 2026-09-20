@@ -243,7 +243,8 @@ export const TSC8042_FORUM: DesiredForum = {
   // Telegram gives every forum a "General" topic that cannot be deleted.
   // Navigation here runs through the managed topics below — `general`
   // ("💬 Загальні питання") is the one for loose questions — so the built-in
-  // one is hidden to keep the topic list unambiguous.
+  // one is hidden to keep the topic list unambiguous. Telegram closes it as
+  // well when it is hidden, which suits: nobody should be posting there.
   hideBuiltInGeneralTopic: true,
   topics: [
     {

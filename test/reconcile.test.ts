@@ -85,6 +85,11 @@ interface FakeForum {
    * delete it through the topic paths.
    */
   generalHidden: boolean;
+  /**
+   * Set by Telegram itself when General is hidden, never by this project.
+   * Kept so a test can assert the reconciler neither sends nor reads it.
+   */
+  generalClosed: boolean;
   topics: Map<number, FakeTopic>;
 }
 
@@ -131,6 +136,16 @@ class FakeTelegram implements ForumApi {
   /** Unhides General behind the reconciler's back, as a person would. */
   setGeneralHiddenByHand(channelId: string, hidden: boolean): void {
     this.forum(channelId).generalHidden = hidden;
+  }
+
+  /**
+   * Closes General the way Telegram does by itself when it is hidden.
+   *
+   * The fake tracks `generalClosed` so a test can prove the reconciler does
+   * not read it; nothing in the project ever sets it.
+   */
+  closeGeneralAsTelegramWould(channelId: string): void {
+    this.forum(channelId).generalClosed = true;
   }
 
   private forum(id: string): FakeForum {
@@ -201,7 +216,13 @@ class FakeTelegram implements ForumApi {
     this.record(`createForumSupergroup(${title})`);
     const id = String(this.nextChannelId++);
     // Telegram shows General in a brand-new forum.
-    this.forums.set(id, { title, description, generalHidden: false, topics: new Map() });
+    this.forums.set(id, {
+      title,
+      description,
+      generalHidden: false,
+      generalClosed: false,
+      topics: new Map(),
+    });
     return { ref: new ForumRef(id, { channelId: id }), id, title };
   }
 
@@ -247,7 +268,12 @@ class FakeTelegram implements ForumApi {
 
   async setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void> {
     this.record(`setGeneralTopicHidden(${forum.id}, ${hidden})`);
-    this.forum(forum.id).generalHidden = hidden;
+    const forumState = this.forum(forum.id);
+    forumState.generalHidden = hidden;
+    // Telegram closes General along with hiding it. Modelled here so the
+    // reconciler meets the behaviour it will actually meet; unhiding does
+    // not re-open it, which is also Telegram's behaviour.
+    if (hidden) forumState.generalClosed = true;
   }
 
   async setMessageText(forum: ForumRef, messageId: number, text: string): Promise<void> {
@@ -699,6 +725,7 @@ describe("unmanaged entities are left alone", () => {
       title: "Fixture forum",
       description: "fixture description",
       generalHidden: false,
+      generalClosed: false,
       topics: new Map([[5, { title: "Alpha", messages: new Map([[6, "someone else's"]]) }]]),
     });
 
@@ -718,6 +745,7 @@ describe("unmanaged entities are left alone", () => {
       title: "Fixture forum",
       description: "fixture description",
       generalHidden: false,
+      generalClosed: false,
       topics: new Map([[5, { title: "Alpha", messages: new Map([[6, "someone else's"]]) }]]),
     };
     api.forums.set("999000111", unmanaged);
@@ -1262,6 +1290,13 @@ describe("the built-in General topic", () => {
       api.mutations.includes("createForumTopic(2000000001, Alpha)"),
       "and must still create our own topics",
     );
+    // Telegram closes General along with hiding it. The project never asks
+    // for that — there is no call in the record that would.
+    assert.equal(api.forums.get(forumId)?.generalClosed, true, "Telegram closes it too");
+    assert.ok(
+      !api.calls.some((call) => call.toLowerCase().includes("closed")),
+      "no call may request a close: the close is the server's own behaviour",
+    );
   });
 
   it("plans it as an UPDATE, never a CREATE — Telegram already made it", async () => {
@@ -1314,6 +1349,23 @@ describe("the built-in General topic", () => {
 
     assert.equal(api.forums.get(forumId)?.generalHidden, true, "it must be hidden again");
     assert.deepEqual(api.mutations.slice(before), [`setGeneralTopicHidden(${forumId}, true)`]);
+  });
+
+  it("stays converged although Telegram closes it as a side effect of hiding", async () => {
+    // Telegram hides *and closes* General: TDLib documents `is_hidden` as
+    // "hidden above the topic list and closed; for General topic only". The
+    // reconciler compares `hidden` alone, so the close the server performed
+    // is not read back as something a person changed.
+    const { api, store, forumId } = await applied(wanting(true));
+    api.closeGeneralAsTelegramWould(forumId);
+
+    const plan = await buildPlan(wanting(true), store.load(), api);
+
+    assert.equal(hasMutations(plan), false, "a server-side close is not a divergence");
+    assert.equal(
+      plan.actions.find((action) => action.resource === "general-topic")?.type,
+      "NOOP",
+    );
   });
 
   it("shows it again when the configuration says it should be visible", async () => {

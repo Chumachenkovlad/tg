@@ -5,6 +5,8 @@ import {
   DESIRED_STATE,
   LIMITS,
   characterCount,
+  measureLength,
+  utf8ByteLength,
   validateDesiredState,
   type DesiredForum,
 } from "../src/telegram/desired-state.js";
@@ -59,6 +61,22 @@ describe("the TSC 8042 desired state", () => {
     assert.equal(forum().title, "ТСЦ 8042 — практичний іспит");
     assert.match(forum().description, /^Неофіційна спільнота кандидатів у водії ТСЦ 8042\./);
     assert.match(forum().description, /не пов’язана з ГСЦ МВС або ТСЦ 8042\.$/);
+  });
+
+  it("fits the description in the characters Telegram counts", () => {
+    // 182 characters but 326 UTF-8 bytes: the description is the one field
+    // where the two measures disagree about this content, so the measure
+    // being the documented one is load-bearing rather than incidental.
+    const description = forum().description;
+    assert.equal(LIMITS.forumDescription.measure, "characters");
+    assert.ok(
+      characterCount(description) <= LIMITS.forumDescription.max,
+      `the description is ${characterCount(description)} characters`,
+    );
+    assert.ok(
+      utf8ByteLength(description) > LIMITS.forumDescription.max,
+      "and would not fit if the limit were counted in bytes — kept as a reminder of why",
+    );
   });
 
   it("declares every topic, under the expected key and in order", () => {
@@ -172,6 +190,21 @@ describe("topic titles", () => {
     const titles = forum().topics.map((topic) => topic.title);
     assert.equal(new Set(titles).size, titles.length);
   });
+
+  it("fit the byte limit with room to spare, emoji and Cyrillic included", () => {
+    // Emoji cost four bytes each and Cyrillic two, so a title that looks
+    // short can still be long to Telegram. The headroom is asserted rather
+    // than just the limit: a title at 127 bytes would pass and still be one
+    // small edit away from failing an apply.
+    for (const topic of forum().topics) {
+      const bytes = utf8ByteLength(topic.title);
+      assert.ok(
+        bytes <= LIMITS.topicTitle.max,
+        `"${topic.title}" is ${bytes} UTF-8 bytes, over the ${LIMITS.topicTitle.max}-byte limit`,
+      );
+      assert.ok(bytes < 100, `"${topic.title}" is ${bytes} UTF-8 bytes, uncomfortably close`);
+    }
+  });
 });
 
 describe("managed messages", () => {
@@ -204,12 +237,12 @@ describe("managed messages", () => {
     }
   });
 
-  it("stays inside Telegram's 4096-character limit for a single message", () => {
+  it("stays inside Telegram's per-message limit", () => {
     for (const topic of forum().topics) {
       for (const message of topic.messages) {
-        const length = [...message.text].length;
+        const length = measureLength(message.text, LIMITS.messageText);
         assert.ok(
-          length <= 4096,
+          length <= LIMITS.messageText.max,
           `message "${topic.key}/${message.key}" is ${length} characters, ` +
             `which Telegram would reject or split`,
         );
@@ -345,8 +378,15 @@ describe("validateDesiredState", () => {
   });
 
   describe("Telegram's length limits", () => {
-    /** A string of exactly `n` code points. */
-    const text = (n: number): string => "я".repeat(n);
+    /**
+     * A string of exactly `n` units, under either measure.
+     *
+     * ASCII is the only filler that weighs 1 as a UTF-8 byte *and* as a
+     * character, which is what lets one table drive the boundary cases for
+     * fields measured differently. Cyrillic and emoji, where the two measures
+     * disagree, get their own blocks below.
+     */
+    const text = (n: number): string => "a".repeat(n);
 
     /** The fixture with one over-long value, built at the given length. */
     const withLength: Record<string, (n: number) => DesiredForum> = {
@@ -360,55 +400,145 @@ describe("validateDesiredState", () => {
     };
 
     const CASES = [
-      ["forum title", LIMITS.forumTitle, 128],
-      ["forum description", LIMITS.forumDescription, 255],
-      ["topic title", LIMITS.topicTitle, 128],
-      ["message text", LIMITS.messageText, 4096],
+      ["forum title", LIMITS.forumTitle, { max: 128, measure: "utf8-bytes" }],
+      ["topic title", LIMITS.topicTitle, { max: 128, measure: "utf8-bytes" }],
+      ["forum description", LIMITS.forumDescription, { max: 255, measure: "characters" }],
+      ["message text", LIMITS.messageText, { max: 4096, measure: "characters" }],
     ] as const;
 
-    for (const [what, limit, expected] of CASES) {
-      it(`caps the ${what} at ${expected}`, () => {
-        assert.equal(limit, expected, "the documented limit must not drift");
+    /**
+     * One unit of the measure, as the shortest string that weighs exactly 1.
+     *
+     * ASCII is one byte and one character, so it is the only filler that can
+     * land a value exactly on a limit under either measure.
+     */
+    const unit = "a";
+
+    for (const [what, limit, documented] of CASES) {
+      const units = documented.measure === "utf8-bytes" ? "UTF-8 bytes" : "characters";
+
+      it(`measures the ${what} in ${units}, capped at ${documented.max}`, () => {
+        assert.deepEqual({ ...limit }, { ...documented }, "the audited limit must not drift");
       });
 
-      it(`accepts a ${what} of exactly ${expected} characters`, () => {
+      it(`accepts a ${what} of exactly ${documented.max} ${units}`, () => {
         const build = withLength[what];
         assert.ok(build);
-        assert.doesNotThrow(() => validateDesiredState({ forums: [build(limit)] }));
+        const forum = build(limit.max);
+        assert.doesNotThrow(() => validateDesiredState({ forums: [forum] }));
       });
 
-      it(`rejects a ${what} one character over`, () => {
+      it(`rejects a ${what} one unit over`, () => {
         const build = withLength[what];
         assert.ok(build);
         assert.throws(
-          () => validateDesiredState({ forums: [build(limit + 1)] }),
-          new RegExp(`is ${limit + 1} characters, over Telegram's limit of ${limit}`),
+          () => validateDesiredState({ forums: [build(limit.max + 1)] }),
+          new RegExp(
+            `is ${limit.max + 1} ${units}, over Telegram's limit of ${limit.max} ${units}`,
+          ),
         );
+      });
+
+      it(`counts the ${what} in ${units}, not UTF-16 units`, () => {
+        // JavaScript's String.length counts UTF-16 units, so a non-BMP emoji
+        // weighs 2 there. Telegram never counts that way under either
+        // measure, so using it would be wrong in both directions.
+        const build = withLength[what];
+        assert.ok(build);
+        const naive = unit.repeat(limit.max);
+        assert.equal(naive.length, measureLength(naive, limit));
       });
     }
 
-    it("counts code points, not UTF-16 units", () => {
-      // "👮" is one character to Telegram and two to String.length. Counting
-      // the wrong one would reject a title Telegram accepts.
-      assert.equal(characterCount("👮"), 1);
-      assert.equal("👮".length, 2);
+    describe("Cyrillic, which costs two bytes and one character", () => {
+      // "я" is 2 UTF-8 bytes and 1 character. Every Ukrainian title and
+      // description in this repository is made of characters like it, so the
+      // two measures genuinely disagree about the real content.
+      it("weighs what each measure says it weighs", () => {
+        assert.equal(utf8ByteLength("я"), 2);
+        assert.equal(characterCount("я"), 1);
+        assert.equal("я".length, 1);
+      });
 
-      const title = "👮".repeat(LIMITS.forumTitle);
-      assert.equal(title.length, LIMITS.forumTitle * 2, "the naive count would be over the limit");
-      assert.doesNotThrow(() => validateDesiredState({ forums: [forumOf({ title })] }));
-    });
-
-    it("rejects an over-long emoji title on the same code-point count", () => {
-      assert.throws(
-        () =>
+      it("fits 64 Cyrillic characters in a 128-byte topic title, and not 65", () => {
+        const fits = "я".repeat(64);
+        assert.equal(utf8ByteLength(fits), 128);
+        assert.doesNotThrow(() =>
           validateDesiredState({
-            forums: [forumOf({ title: "👮".repeat(LIMITS.forumTitle + 1) })],
+            forums: [forumOf({ topics: [{ key: "t", title: fits, messages: [] }] })],
           }),
-        /is 129 characters/,
-      );
+        );
+
+        assert.throws(
+          () =>
+            validateDesiredState({
+              forums: [forumOf({ topics: [{ key: "t", title: "я".repeat(65), messages: [] }] })],
+            }),
+          /is 130 UTF-8 bytes, over Telegram's limit of 128 UTF-8 bytes/,
+        );
+      });
+
+      it("fits 255 Cyrillic characters in the description, though they are 510 bytes", () => {
+        const description = "я".repeat(255);
+        assert.equal(utf8ByteLength(description), 510);
+        assert.doesNotThrow(() => validateDesiredState({ forums: [forumOf({ description })] }));
+
+        assert.throws(
+          () => validateDesiredState({ forums: [forumOf({ description: "я".repeat(256) })] }),
+          /is 256 characters, over Telegram's limit of 255 characters/,
+        );
+      });
     });
 
-    it("names the value it rejected, so a long config is searchable", () => {
+    describe("non-BMP emoji, which cost four bytes and one character", () => {
+      // "👮" is 4 UTF-8 bytes, 1 character, and 2 UTF-16 units — all three
+      // counts differ, which is what makes it the useful regression case.
+      it("weighs what each measure says it weighs", () => {
+        assert.equal(utf8ByteLength("👮"), 4);
+        assert.equal(characterCount("👮"), 1);
+        assert.equal("👮".length, 2);
+      });
+
+      it("fits 32 emoji in a 128-byte title, and not 33", () => {
+        const fits = "👮".repeat(32);
+        assert.equal(utf8ByteLength(fits), 128);
+        assert.doesNotThrow(() => validateDesiredState({ forums: [forumOf({ title: fits })] }));
+
+        assert.throws(
+          () => validateDesiredState({ forums: [forumOf({ title: "👮".repeat(33) })] }),
+          /is 132 UTF-8 bytes, over Telegram's limit of 128 UTF-8 bytes/,
+        );
+      });
+
+      it("no longer accepts 128 emoji in a title, which the byte limit forbids", () => {
+        // This is the regression: counting characters let 128 emoji through
+        // as "128 characters", which is 512 UTF-8 bytes.
+        const title = "👮".repeat(128);
+        assert.equal(characterCount(title), 128, "128 by the character count");
+        assert.equal(utf8ByteLength(title), 512, "but 512 UTF-8 bytes");
+
+        assert.throws(
+          () => validateDesiredState({ forums: [forumOf({ title })] }),
+          /is 512 UTF-8 bytes, over Telegram's limit of 128 UTF-8 bytes/,
+        );
+      });
+
+      it("counts an emoji as one character in a message, not two", () => {
+        // The message limit is in characters, so the UTF-16 count would
+        // wrongly halve how much text fits.
+        const text = "👮".repeat(LIMITS.messageText.max);
+        assert.equal(text.length, LIMITS.messageText.max * 2);
+        assert.doesNotThrow(() =>
+          validateDesiredState({
+            forums: [
+              forumOf({ topics: [{ key: "t", title: "T", messages: [{ key: "m", text }] }] }),
+            ],
+          }),
+        );
+      });
+    });
+
+    it("names the value and the measure it rejected, so a long config is searchable", () => {
       assert.throws(
         () =>
           validateDesiredState({
@@ -420,7 +550,12 @@ describe("validateDesiredState", () => {
               }),
             ],
           }),
-        /text of message "a\/t\/m"/,
+        /The text of message "a\/t\/m" is 4097 characters/,
+      );
+
+      assert.throws(
+        () => validateDesiredState({ forums: [forumOf({ title: "я".repeat(65) })] }),
+        /The title of forum "a" is 130 UTF-8 bytes/,
       );
     });
   });

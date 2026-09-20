@@ -85,6 +85,10 @@ export interface UpdateForumAction extends BaseAction {
  *
  * There is no CREATE counterpart: Telegram made the topic when it made the
  * forum, so the only action it can ever take is this one.
+ *
+ * Only `hidden` is compared and only `hidden` is sent. Telegram closes
+ * General itself when it is hidden, and reading that back as a divergence
+ * would leave the plan permanently un-converged.
  */
 export interface UpdateGeneralTopicAction extends BaseAction {
   type: "UPDATE";

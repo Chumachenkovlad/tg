@@ -93,7 +93,14 @@ export interface ResolvedForum {
  */
 export const GENERAL_TOPIC_ID = 1;
 
-/** What Telegram currently holds for the built-in General topic. */
+/**
+ * What Telegram currently holds for the built-in General topic.
+ *
+ * Only `hidden` is carried, because only `hidden` is reconciled. Telegram
+ * closes General by itself when it is hidden, so its `closed` flag follows
+ * from this one and is deliberately not read: treating a close the server
+ * performed as a divergence would make the plan never converge.
+ */
 export interface GeneralTopicState {
   /** True when the topic is hidden from the forum's topic list. */
   hidden: boolean;
@@ -184,6 +191,9 @@ export interface ForumApi {
   /**
    * Hides or shows the built-in General topic. Nothing is created or deleted:
    * `hidden` is a flag on a topic that always exists.
+   *
+   * Hiding it also closes it, server-side. That is Telegram's behaviour, not
+   * a second operation performed here.
    */
   setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void>;
   /** Edits a message's text in place. Its message id does not change. */

@@ -45,6 +45,9 @@ export interface DesiredForum {
    * created here, never recorded in the managed state, and never treated as
    * content this project owns. Reconciled both ways — unhide it by hand and
    * the next plan offers to hide it again.
+   *
+   * Telegram closes General as well when it is hidden. That is the server's
+   * behaviour; nothing here asks for it, and no other topic is ever closed.
    */
   hideBuiltInGeneralTopic: boolean;
   topics: DesiredTopic[];
@@ -60,23 +63,71 @@ export const DESIRED_STATE: DesiredState = {
 };
 
 /**
- * What Telegram accepts, in **code points**.
+ * How Telegram measures a field's length.
  *
- * Telegram counts characters, not UTF-8 bytes, and emoji and Cyrillic are
- * exactly as expensive as ASCII — so every check below counts `[...value]`
- * rather than `value.length`, which would count a non-BMP emoji twice and
- * reject a title Telegram would have taken.
+ * Neither is `String.length`. JavaScript counts UTF-16 code units, so a
+ * non-BMP emoji weighs 2 there and 1 everywhere Telegram counts characters —
+ * using it would reject titles Telegram accepts.
+ */
+export type LengthMeasure = "utf8-bytes" | "characters";
+
+export interface LengthLimit {
+  readonly max: number;
+  readonly measure: LengthMeasure;
+}
+
+/**
+ * What Telegram accepts, per field, with the measure it is counted in.
+ *
+ * The measure is **not** uniform, so each field carries its own rather than
+ * sharing one counter:
+ *
+ * - **Titles** are validated in UTF-8 bytes. The MTProto method pages state
+ *   the constraint on `messages.createForumTopic` / `messages.editForumTopic`
+ *   as "maximum UTF-8 length: 128". TDLib counts the same limit in Unicode
+ *   characters (`MAX_FORUM_TOPIC_TITLE_LENGTH = 128`, applied through
+ *   `clean_name` → `utf8_truncate`, "truncates UTF-8 string to the given
+ *   length in Unicode characters"), so the two readings differ for non-ASCII
+ *   text. Bytes are the stricter of the two and can never exceed what the
+ *   character reading allows, so validating in bytes is refused-early rather
+ *   than refused-by-Telegram, halfway through an apply.
+ * - **The description** is validated in characters: TDLib documents
+ *   `setChatDescription` as "0-255 characters" and truncates it with
+ *   `strip_empty_characters` → `utf8_truncate`, again by character. Counting
+ *   its bytes instead would cut a Ukrainian description to roughly half the
+ *   text Telegram accepts.
+ * - **Message text** is validated in characters, which is not in dispute:
+ *   the limit is the `message_text_length_max` config value (4096) and TDLib
+ *   checks it with `utf8_length`, documented as "length of UTF-8 string in
+ *   characters".
  */
 export const LIMITS = {
-  forumTitle: 128,
-  topicTitle: 128,
-  forumDescription: 255,
-  messageText: 4096,
-} as const;
+  forumTitle: { max: 128, measure: "utf8-bytes" },
+  topicTitle: { max: 128, measure: "utf8-bytes" },
+  forumDescription: { max: 255, measure: "characters" },
+  messageText: { max: 4096, measure: "characters" },
+} as const satisfies Record<string, LengthLimit>;
 
-/** Code points, not UTF-16 units: `"👮".length` is 2, this returns 1. */
+const UTF8 = new TextEncoder();
+
+/** Bytes of the UTF-8 encoding: 1 for "a", 2 for "я", 4 for "👮". */
+export function utf8ByteLength(value: string): number {
+  return UTF8.encode(value).length;
+}
+
+/** Unicode characters, not UTF-16 units: `"👮".length` is 2, this returns 1. */
 export function characterCount(value: string): number {
   return [...value].length;
+}
+
+/** Measures `value` the way `limit` is counted. */
+export function measureLength(value: string, limit: LengthLimit): number {
+  return limit.measure === "utf8-bytes" ? utf8ByteLength(value) : characterCount(value);
+}
+
+/** The measure's name, for an error a person has to act on. */
+function unitsOf(measure: LengthMeasure): string {
+  return measure === "utf8-bytes" ? "UTF-8 bytes" : "characters";
 }
 
 /**
@@ -142,12 +193,13 @@ function assertNonEmpty(value: string, what: string): void {
   if (value.trim() === "") throw new Error(`Empty ${what} in the desired state.`);
 }
 
-/** Exactly at the limit is fine; one code point past it is not. */
-function assertWithinLimit(value: string, limit: number, what: string): void {
-  const length = characterCount(value);
-  if (length > limit) {
+/** Exactly at the limit is fine; one unit past it is not. */
+function assertWithinLimit(value: string, limit: LengthLimit, what: string): void {
+  const length = measureLength(value, limit);
+  if (length > limit.max) {
+    const units = unitsOf(limit.measure);
     throw new Error(
-      `The ${what} is ${length} characters, over Telegram's limit of ${limit}. ` +
+      `The ${what} is ${length} ${units}, over Telegram's limit of ${limit.max} ${units}. ` +
         `Shorten it in the desired state.`,
     );
   }

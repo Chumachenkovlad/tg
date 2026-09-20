@@ -182,8 +182,24 @@ next plan offers to hide it again:
 The path is parenthesised so it cannot collide with a managed topic key and
 reads at a glance as something that is not ours. Hiding is
 `messages.editForumTopic` with the `hidden` flag on topic `1` — Telegram
-accepts that flag only for General. Hiding is not closing, and this PR adds no
-pinning, topic closing, permissions, invite links or anti-spam automation.
+accepts that flag only for General.
+
+**Hiding General also closes it, server-side.** That is Telegram's behaviour,
+not something this project asks for: TDLib documents `is_hidden` as "True, if
+the topic is hidden above the topic list **and closed**; for General topic
+only", and its `toggleGeneralForumTopicIsHidden` parameter as "Pass true to
+**hide and close** the General topic; pass false to unhide it". So after an
+apply, General comes back from Telegram both hidden and closed.
+
+The request still sends `hidden` **alone**, with no `closed` flag — exactly as
+TDLib does. Closing is a separate operation this project does not perform, and
+the reconciler neither sets nor reads `closed`: it compares only `hidden`, so
+the close that Telegram applies by itself is never mistaken for a change
+someone made by hand, and unhiding sends only `hidden: false` (Telegram's
+unhide does not re-open the topic on its own).
+
+This PR adds no pinning, topic closing, permissions, invite links or anti-spam
+automation.
 
 Topic order in the file is the order they are created in on a first apply. It
 is not enforced afterwards — Telegram sorts a forum's topic list by activity,
@@ -484,19 +500,40 @@ calls `sendMessageToTopic(forum, topicId, text)`.
   titles and message bodies, and anything past Telegram's length limits stop
   the run before a single resource is created.
 
-  | Value | Limit |
-  | --- | --- |
-  | forum title | 128 |
-  | topic title | 128 |
-  | forum description | 255 |
-  | managed message | 4096 |
+  The measure is **not the same for every field**, so each carries its own
+  rather than sharing one counter:
 
-  Counted in **code points**, not UTF-16 units — `"👮".length` is 2 but
-  Telegram counts it once, so counting the wrong one would reject a title
-  Telegram accepts. Exactly at the limit passes; one character over does not.
-  The error names the offending value by its logical path
-  (`text of message "tsc8042/rules/intro"`), so it is searchable in a long
-  configuration.
+  | Value | Limit | Measured in |
+  | --- | --- | --- |
+  | forum title | 128 | UTF-8 bytes |
+  | topic title | 128 | UTF-8 bytes |
+  | forum description | 255 | characters |
+  | managed message | 4096 | characters |
+
+  **Titles** are checked in UTF-8 bytes. The MTProto method pages state the
+  constraint on `messages.createForumTopic` / `messages.editForumTopic` as
+  "maximum UTF-8 length: 128", while TDLib counts the same limit in Unicode
+  characters (`MAX_FORUM_TOPIC_TITLE_LENGTH = 128`, applied through
+  `clean_name` → `utf8_truncate`, "truncates UTF-8 string to the given length
+  in Unicode characters"). The two readings differ for non-ASCII text, and
+  bytes are the stricter, so a title that passes here passes under either.
+
+  **The description** is checked in characters: TDLib documents
+  `setChatDescription` as "0-255 characters" and truncates it by character.
+  Counting its bytes instead would cut a Ukrainian description to roughly half
+  the text Telegram accepts — this repository's own description is 182
+  characters but 326 bytes.
+
+  **Message text** is checked in characters, which is not in dispute: the
+  limit is the `message_text_length_max` config value (4096) and TDLib checks
+  it with `utf8_length`, "length of UTF-8 string in characters".
+
+  None of them is JavaScript's `String.length`, which counts UTF-16 units and
+  weighs a non-BMP emoji twice. Exactly at the limit passes; one unit over
+  does not. The error names the offending value by its logical path and the
+  measure it was counted in (`The text of message "tsc8042/rules/intro" is
+  4097 characters, over Telegram's limit of 4096 characters`), so it is
+  searchable and actionable in a long configuration.
 - **Unknown flags are rejected** with exit code 2. A typo like `--yse` is an
   error, never a silent fall-through to the default. `telegram:plan` rejects
   `--yes` outright: it has nothing to confirm.
@@ -607,10 +644,19 @@ alongside the managed topics, `NOOP` on an unchanged second plan, hidden again
 after someone unhides it by hand, shown again when the configuration asks for
 it, id `1` never appearing in the mapping, never mixed into the recorded-topic
 existence check, no state written for it, and a compile-time assertion that no
-`CREATE` action can carry that resource at all. Length validation is covered
-at the boundary — exactly at the limit and one code point over, for each of
-the four limits, including an emoji title whose UTF-16 length would wrongly
-fail.
+`CREATE` action can carry that resource at all, and a test that closing
+General server-side — which is what Telegram does when it is hidden — is not
+read back as a divergence, so the plan still converges.
+
+Length validation is covered at the boundary: exactly at the limit and one
+unit over, for each of the four limits, in the measure that limit is counted
+in. Cyrillic and non-BMP emoji have their own cases, since the three counts
+diverge there — `"я"` is 2 bytes and 1 character, `"👮"` is 4 bytes, 1
+character and 2 UTF-16 units. Those pin the semantics: 64 Cyrillic characters
+fit a 128-byte topic title and 65 do not; 255 Cyrillic characters fit the
+description although they are 510 bytes; and 128 emoji in a title are now
+rejected at 512 UTF-8 bytes, which the earlier character-only counter let
+through.
 
 For reconciliation they also cover: a first run planning three creates; a second
 run against the applied state planning zero mutations, repeatedly and with no

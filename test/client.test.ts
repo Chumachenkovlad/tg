@@ -631,7 +631,11 @@ describe("TL parameter types", () => {
     assert.equal(edits[0]?.topicId, 1, "General is always topic id 1");
     assert.equal(edits[0]?.hidden, true);
     assert.equal(edits[0]?.title, undefined, "hiding must not rename it");
-    assert.equal(edits[0]?.closed, undefined, "hiding is not closing");
+    // Telegram closes General by itself when it is hidden. That is the
+    // server's doing: the request carries `hidden` alone, never `closed`,
+    // which is what TDLib sends too. Setting `closed` here would be this
+    // project performing an operation it does not offer.
+    assert.equal(edits[0]?.closed, undefined, "the close is Telegram's, not ours to request");
   });
 
   it("shows General again with the same flag set to false", async () => {

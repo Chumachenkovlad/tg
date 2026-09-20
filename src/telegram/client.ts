@@ -444,6 +444,13 @@ export class TelegramAccountClient implements ForumApi {
    * `hidden` is a flag on `messages.editForumTopic`, and Telegram accepts it
    * only for the General topic. Nothing is created or deleted: General cannot
    * be removed, and this project never claims to own it.
+   *
+   * **Telegram also closes General when it is hidden.** TDLib documents its
+   * `is_hidden` as "hidden above the topic list and closed; for General topic
+   * only", and its toggle as "pass true to hide and close". That close is the
+   * server's, so the request carries `hidden` alone and never `closed` —
+   * which is what TDLib sends as well. Unhiding likewise sends only
+   * `hidden: false`; it does not re-open the topic.
    */
   async setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void> {
     await this.client.invoke(
