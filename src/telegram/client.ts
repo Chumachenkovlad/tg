@@ -6,12 +6,14 @@ import { Logger, LogLevel } from "teleproto/extensions/Logger.js";
 import { FileSessionStore } from "./session-store.js";
 import {
   ForumRef,
+  GENERAL_TOPIC_ID,
   type CreatedForum,
   type CreatedTopic,
   type DialogSummary,
   type ExistingMessage,
   type ExistingTopic,
   type ForumApi,
+  type GeneralTopicState,
   type PostedMessage,
   type ResolvedForum,
 } from "./forum-types.js";
@@ -200,12 +202,16 @@ export class TelegramAccountClient implements ForumApi {
    *
    * Private is the default: no username is requested, so the group is not
    * public and nobody is invited. Nothing else on the account is touched.
+   *
+   * The description goes out with this same call rather than as a follow-up
+   * edit: a second request could fail, leaving a created group carrying no
+   * description until the next apply.
    */
-  async createForumSupergroup(title: string): Promise<CreatedForum> {
+  async createForumSupergroup(title: string, description: string): Promise<CreatedForum> {
     const updates = await this.client.invoke(
       new Api.channels.CreateChannel({
         title,
-        about: "",
+        about: description,
         megagroup: true,
         forum: true,
       }),
@@ -289,6 +295,11 @@ export class TelegramAccountClient implements ForumApi {
    * The access hash is not persisted anywhere, so it is recovered here from
    * the chat list. That doubles as the existence check: a forum that was
    * deleted, or that this account has left, simply is not in the list.
+   *
+   * The description is not in the chat list — only the full channel carries
+   * it — so one extra read follows for the forum that matched. It is the
+   * only way the planner can tell a description that already matches from
+   * one that needs editing.
    */
   async findForumById(id: string): Promise<ResolvedForum | undefined> {
     const dialogs = await this.client.getDialogs();
@@ -302,13 +313,50 @@ export class TelegramAccountClient implements ForumApi {
       // gone rather than trying to put topics into it.
       if (!entity.forum) continue;
 
+      const ref = TelegramAccountClient.refFor(entity.id, entity.accessHash);
       return {
-        ref: TelegramAccountClient.refFor(entity.id, entity.accessHash),
+        ref,
         title: entity.title,
+        description: await this.readForumDescription(ref),
       };
     }
 
     return undefined;
+  }
+
+  /** Read-only: the group's current "about" text, or "" when it has none. */
+  private async readForumDescription(forum: ForumRef): Promise<string> {
+    const full = await this.client.invoke(
+      // channels.getFullChannel takes `channel:InputChannel`, not an InputPeer.
+      new Api.channels.GetFullChannel({ channel: TelegramAccountClient.channelOf(forum) }),
+    );
+
+    // Only a ChannelFull carries `about`; anything else means no description
+    // this planner could compare against.
+    return full.fullChat instanceof Api.ChannelFull ? full.fullChat.about : "";
+  }
+
+  /**
+   * Read-only: what Telegram currently holds for the built-in General topic.
+   *
+   * Undefined means Telegram did not report it, which for a forum should not
+   * happen — the caller decides what to make of that rather than this method
+   * guessing a value the planner would then compare against.
+   */
+  async readGeneralTopic(forum: ForumRef): Promise<GeneralTopicState | undefined> {
+    const result = await this.client.invoke(
+      new Api.messages.GetForumTopicsByID({
+        peer: TelegramAccountClient.peerOf(forum),
+        topics: [GENERAL_TOPIC_ID],
+      }),
+    );
+
+    const general = result.topics.find(
+      (topic): topic is Api.ForumTopic =>
+        topic instanceof Api.ForumTopic && topic.id === GENERAL_TOPIC_ID,
+    );
+    // `hidden` is a TL flag: present means true, absent means false.
+    return general ? { hidden: general.hidden === true } : undefined;
   }
 
   /** Read-only: which of these topics still exist, with their current titles. */
@@ -364,6 +412,21 @@ export class TelegramAccountClient implements ForumApi {
     );
   }
 
+  /**
+   * Rewrites the forum's description in place. The channel id does not change.
+   *
+   * `messages.editChatAbout` is the method for both chats and channels — there
+   * is no `channels.editAbout` — so this one takes `peer:InputPeer`.
+   */
+  async setForumDescription(forum: ForumRef, description: string): Promise<void> {
+    await this.client.invoke(
+      new Api.messages.EditChatAbout({
+        peer: TelegramAccountClient.peerOf(forum),
+        about: description,
+      }),
+    );
+  }
+
   /** Renames a topic in place. The topic id does not change. */
   async setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void> {
     await this.client.invoke(
@@ -371,6 +434,30 @@ export class TelegramAccountClient implements ForumApi {
         peer: TelegramAccountClient.peerOf(forum),
         topicId,
         title,
+      }),
+    );
+  }
+
+  /**
+   * Hides or shows Telegram's built-in General topic.
+   *
+   * `hidden` is a flag on `messages.editForumTopic`, and Telegram accepts it
+   * only for the General topic. Nothing is created or deleted: General cannot
+   * be removed, and this project never claims to own it.
+   *
+   * **Telegram also closes General when it is hidden.** TDLib documents its
+   * `is_hidden` as "hidden above the topic list and closed; for General topic
+   * only", and its toggle as "pass true to hide and close". That close is the
+   * server's, so the request carries `hidden` alone and never `closed` —
+   * which is what TDLib sends as well. Unhiding likewise sends only
+   * `hidden: false`; it does not re-open the topic.
+   */
+  async setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void> {
+    await this.client.invoke(
+      new Api.messages.EditForumTopic({
+        peer: TelegramAccountClient.peerOf(forum),
+        topicId: GENERAL_TOPIC_ID,
+        hidden,
       }),
     );
   }

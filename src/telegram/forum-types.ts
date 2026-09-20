@@ -73,12 +73,37 @@ export interface CreatedForum {
 /**
  * A forum recorded in local state, found alive in Telegram.
  *
- * Carries the title Telegram currently holds, which is what the planner
- * compares the desired title against.
+ * Carries the title and description Telegram currently holds, which is what
+ * the planner compares the desired ones against.
  */
 export interface ResolvedForum {
   ref: ForumRef;
   title: string;
+  /** The group's "about" text. Empty when it has none. */
+  description: string;
+}
+
+/**
+ * Telegram's built-in "General" topic.
+ *
+ * Every forum has one, it is always this id, and it cannot be deleted. It is
+ * therefore never created by this project and never recorded in the managed
+ * state: it is not ours, it merely exists, and the only thing reconciled
+ * about it is whether it is hidden.
+ */
+export const GENERAL_TOPIC_ID = 1;
+
+/**
+ * What Telegram currently holds for the built-in General topic.
+ *
+ * Only `hidden` is carried, because only `hidden` is reconciled. Telegram
+ * closes General by itself when it is hidden, so its `closed` flag follows
+ * from this one and is deliberately not read: treating a close the server
+ * performed as a divergence would make the plan never converge.
+ */
+export interface GeneralTopicState {
+  /** True when the topic is hidden from the forum's topic list. */
+  hidden: boolean;
 }
 
 /** A topic found alive in Telegram, with the title it currently has. */
@@ -128,6 +153,15 @@ export interface ForumApi {
    * than against anything it remembered.
    */
   findForumById(id: string): Promise<ResolvedForum | undefined>;
+  /**
+   * Read-only: the current state of the built-in General topic, or undefined
+   * when Telegram does not report it.
+   *
+   * Deliberately separate from {@link listExistingTopics}: General is not one
+   * of the topics this project owns, and must not be mixed into the list of
+   * recorded ids that drives creation and recreation.
+   */
+  readGeneralTopic(forum: ForumRef): Promise<GeneralTopicState | undefined>;
   /** Read-only: which of these topics still exist, and their current titles. */
   listExistingTopics(forum: ForumRef, topicIds: readonly number[]): Promise<ExistingTopic[]>;
   /** Read-only: which of these messages still exist, and their current text. */
@@ -136,8 +170,13 @@ export interface ForumApi {
     messageIds: readonly number[],
   ): Promise<ExistingMessage[]>;
 
-  /** Creates a private supergroup with forum topics enabled. */
-  createForumSupergroup(title: string): Promise<CreatedForum>;
+  /**
+   * Creates a private supergroup with forum topics enabled.
+   *
+   * The description is set by the same call, so a freshly created forum is
+   * never briefly public-facing with the wrong "about" text.
+   */
+  createForumSupergroup(title: string, description: string): Promise<CreatedForum>;
   /** Creates one topic in a forum. */
   createForumTopic(forum: ForumRef, title: string): Promise<CreatedTopic>;
   /** Sends one top-level message into a specific forum topic. */
@@ -145,8 +184,18 @@ export interface ForumApi {
 
   /** Renames a forum in place. Its channel id does not change. */
   setForumTitle(forum: ForumRef, title: string): Promise<void>;
+  /** Rewrites a forum's description in place. Its channel id does not change. */
+  setForumDescription(forum: ForumRef, description: string): Promise<void>;
   /** Renames a topic in place. Its topic id does not change. */
   setTopicTitle(forum: ForumRef, topicId: number, title: string): Promise<void>;
+  /**
+   * Hides or shows the built-in General topic. Nothing is created or deleted:
+   * `hidden` is a flag on a topic that always exists.
+   *
+   * Hiding it also closes it, server-side. That is Telegram's behaviour, not
+   * a second operation performed here.
+   */
+  setGeneralTopicHidden(forum: ForumRef, hidden: boolean): Promise<void>;
   /** Edits a message's text in place. Its message id does not change. */
   setMessageText(forum: ForumRef, messageId: number, text: string): Promise<void>;
 }

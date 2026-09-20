@@ -11,6 +11,11 @@ Current scope:
    messages that should exist; `telegram:plan` shows the difference and
    `telegram:apply` closes it.
 
+What it currently manages: **ТСЦ 8042 — практичний іспит**, a private Telegram
+forum for candidates taking the practical driving exam at service centre 8042.
+Its structure and all of its Ukrainian copy live in
+[`src/telegram/content/tsc8042.ts`](src/telegram/content/tsc8042.ts).
+
 Reconciliation is convergent: applying an unchanged configuration a second
 time sends no mutating request at all. Editing a title or a message text in
 the configuration produces an in-place `UPDATE` of the existing resource, not
@@ -35,7 +40,8 @@ leak into the rest of the project:
 | `src/telegram/config.ts` | Environment configuration |
 | `src/telegram/session-store.ts` | Session persistence on disk |
 | `src/telegram/format-dialogs.ts` | Rendering for the inspection output |
-| `src/telegram/desired-state.ts` | **What should exist**, by stable key |
+| `src/telegram/desired-state.ts` | **What should exist**, by stable key — shape, types and validation |
+| `src/telegram/content/tsc8042.ts` | **The TSC 8042 community itself**: every title, description and message, in Ukrainian |
 | `src/telegram/managed-state.ts` | **What was created**: logical key → Telegram id, committed to git |
 | `src/telegram/mutation-lock.ts` | Exclusive lock serializing applies |
 | `src/telegram/planner.ts` | Compares the two against Telegram and produces the plan |
@@ -95,25 +101,109 @@ change to any chat. Access hashes are never printed.
 
 ## Desired state and reconciliation
 
-What should exist is declared in `src/telegram/desired-state.ts`:
+`src/telegram/desired-state.ts` holds the shape, the types and the validation.
+The configuration itself — the TSC 8042 community — lives in
+`src/telegram/content/tsc8042.ts`, so long Telegram copy never ends up in the
+client or the reconciler:
 
 ```ts
 {
-  forums: [{
-    key: "tsc8042",
-    title: "TSC 8042 Test",
-    topics: [{
-      key: "test",
-      title: "🧪 Тест",
-      messages: [{ key: "intro", text: "Тест автоматизації Telegram API" }],
-    }],
-  }],
+  key: "tsc8042",
+  title: "ТСЦ 8042 — практичний іспит",
+  description: "Неофіційна спільнота кандидатів у водії ТСЦ 8042. …",
+  topics: [
+    { key: "rules",        title: "📌 Правила та навігація", messages: [{ key: "intro", text: "…" }] },
+    { key: "registration", title: "🎫 Реєстрація на іспит",  messages: [{ key: "intro", text: "…" }] },
+    // … 14 topics, each with one managed `intro` message
+  ],
 }
 ```
 
-Every resource is identified by its **stable key**, never by its title. Titles
-and message text are content; renaming one must not make the reconciler think
-it is looking at a different resource, and it does not.
+Every resource is identified by its **stable key**, never by its title. Keys
+are lowercase ASCII slugs (`rules`, `difficult-places`, `exam-reports`);
+titles carry the emoji and the wording and may be rewritten freely. Renaming
+one must not make the reconciler think it is looking at a different resource,
+and it does not.
+
+All user-facing Telegram content is Ukrainian. Only the keys are English, and
+only because they are machine names.
+
+### What is configured
+
+One private forum, `tsc8042` — "ТСЦ 8042 — практичний іспит" — for candidates
+taking the practical driving exam at service centre 8042, with fourteen topics
+and one managed `intro` message in each:
+
+| Key | Title |
+| --- | --- |
+| `rules` | 📌 Правила та навігація |
+| `announcements` | 📢 Оголошення |
+| `registration` | 🎫 Реєстрація на іспит |
+| `routes` | 🗺 Маршрути 8042 |
+| `difficult-places` | 🚧 Складні місця маршрутів |
+| `exam-reports` | 📝 Звіти з іспитів |
+| `successful-exams` | ✅ Успішні іспити |
+| `mistakes` | ⚠️ Помилки та втручання |
+| `examiners` | 👮 Екзаменатори — досвід |
+| `appeals` | ⚖️ Оскарження |
+| `recordings` | 🎥 Відеозаписи іспиту |
+| `statistics` | 📊 Статистика |
+| `general` | 💬 Загальні питання |
+| `moderation` | 🚨 Модерація / шахрайство |
+
+The group is private: `channels.createChannel` is called without a username,
+so nothing is public, and no user is ever invited or added by this project.
+
+#### Telegram's built-in General topic
+
+Every forum Telegram creates carries a **General** topic, always id `1`, which
+cannot be deleted. It is not one of the topics above and it is **not** this
+project's to own: it is never created, never renamed, never recorded in
+`telegram/managed-state.json`, and there is no code path that could delete it —
+`general-topic` is a resource of its own in the action union, and the union
+has no `CREATE` for it, which a test asserts at compile time.
+
+The one thing reconciled about it is whether it is hidden:
+
+```ts
+hideBuiltInGeneralTopic: true
+```
+
+Navigation here runs through the managed topics, and `general`
+("💬 Загальні питання") is the one people are pointed at for loose questions,
+so the built-in one is hidden to keep the topic list unambiguous. It is
+reconciled in both directions — unhide it by hand in the Telegram app and the
+next plan offers to hide it again:
+
+```
+  UPDATE general-topic tsc8042/(general)  (built-in General topic is visible, should be hidden)
+```
+
+The path is parenthesised so it cannot collide with a managed topic key and
+reads at a glance as something that is not ours. Hiding is
+`messages.editForumTopic` with the `hidden` flag on topic `1` — Telegram
+accepts that flag only for General.
+
+**Hiding General also closes it, server-side.** That is Telegram's behaviour,
+not something this project asks for: TDLib documents `is_hidden` as "True, if
+the topic is hidden above the topic list **and closed**; for General topic
+only", and its `toggleGeneralForumTopicIsHidden` parameter as "Pass true to
+**hide and close** the General topic; pass false to unhide it". So after an
+apply, General comes back from Telegram both hidden and closed.
+
+The request still sends `hidden` **alone**, with no `closed` flag — exactly as
+TDLib does. Closing is a separate operation this project does not perform, and
+the reconciler neither sets nor reads `closed`: it compares only `hidden`, so
+the close that Telegram applies by itself is never mistaken for a change
+someone made by hand, and unhiding sends only `hidden: false` (Telegram's
+unhide does not re-open the topic on its own).
+
+This PR adds no pinning, topic closing, permissions, invite links or anti-spam
+automation.
+
+Topic order in the file is the order they are created in on a first apply. It
+is not enforced afterwards — Telegram sorts a forum's topic list by activity,
+and nothing here reorders topics.
 
 ### Plan
 
@@ -122,16 +212,19 @@ npm run telegram:plan
 ```
 
 Read-only. It connects, reads the committed mapping, **verifies every id in
-it against Telegram** — including the title and text each resource currently
-has — compares that with the desired state and prints the plan. It sends no
-request that could change anything, and takes no lock.
+it against Telegram** — including the title, description and text each
+resource currently has — compares that with the desired state and prints the
+plan. It sends no request that could change anything, and takes no lock.
 
 ```
-  CREATE forum   tsc8042             (not created yet)
-  CREATE topic   tsc8042/test        (the forum is being created)
-  CREATE message tsc8042/test/intro  (the forum is being created)
+  CREATE forum   tsc8042                     (not created yet)
+  CREATE topic   tsc8042/rules               (the forum is being created)
+  CREATE message tsc8042/rules/intro         (the forum is being created)
+  CREATE topic   tsc8042/announcements       (the forum is being created)
+  CREATE message tsc8042/announcements/intro (the forum is being created)
+  …
 
-Plan: 3 to create, 0 to update, 0 to delete, 0 unchanged.
+Plan: 29 to create, 0 to update, 0 to delete, 0 unchanged.
 ```
 
 ### Apply
@@ -149,9 +242,10 @@ halfway through leaves the mapping describing exactly what exists.
 Run it again with an unchanged configuration and everything comes out `NOOP`:
 
 ```
-  NOOP   forum   tsc8042             (exists as 2000000042, title matches)
-  NOOP   topic   tsc8042/test        (exists as 100, title matches)
-  NOOP   message tsc8042/test/intro  (exists as 101, text matches)
+  NOOP   forum   tsc8042              (exists as 2000000042, title and description match)
+  NOOP   topic   tsc8042/rules        (exists as 100, title matches)
+  NOOP   message tsc8042/rules/intro  (exists as 101, text matches)
+  …
 
 Already up to date. Nothing to do.
 ```
@@ -160,22 +254,42 @@ No confirmation is asked for in that case — there is nothing to confirm.
 
 ### Editing the configuration
 
-Change a title or a message text, keep the key, and the next plan is an
-`UPDATE` of the resource that already exists:
+**Edit the text, keep the key.** Change a title, a description or a message
+body in `src/telegram/content/tsc8042.ts` and the next plan is an `UPDATE` of
+the resource that already exists — never a second one:
 
 ```
-  NOOP   forum   tsc8042             (exists as 2000000042, title matches)
-  UPDATE topic   tsc8042/test        (title is "🧪 Тест", should be "🗺 Маршрути 8042")
-  UPDATE message tsc8042/test/intro  (text is "v1", should be "v2")
+  UPDATE forum   tsc8042              (description is "Неофіційна спільнота…", should be "…")
+  UPDATE topic   tsc8042/routes       (title is "🗺 Маршрути 8042", should be "🗺 Маршрути ТСЦ 8042")
+  UPDATE message tsc8042/routes/intro (text is "Тут збираємо…", should be "…")
+  NOOP   topic   tsc8042/rules        (exists as 100, title matches)
 ```
 
-Applying it renames the topic and edits the message **in place**. The channel
-id, the topic id and the message id are unchanged, so the mapping does not
-move and the run after it is all `NOOP` again.
+Applying it edits the description, renames the topic and rewrites the message
+**in place**: `channels.editTitle`, `messages.editChatAbout`,
+`messages.editForumTopic` and `messages.editMessage`. The channel id, the
+topic id and the message id are all unchanged, so no new group, topic or
+message appears, the mapping in `telegram/managed-state.json` does not move,
+and the run after it is all `NOOP` again.
+
+This is what makes the two commands safe to re-run: identity is the recorded
+Telegram id, so **a changed title is an edit of an existing resource, not a
+duplicate of it**. The only thing that produces a `CREATE` for a key that was
+already applied is the resource genuinely being gone from Telegram.
+
+A forum has two editable attributes, and each is a separate Telegram method,
+so the plan carries one `UPDATE` per attribute that actually differs — change
+only the description and only `messages.editChatAbout` is sent.
+
+Adding a new topic or a new managed message is a `CREATE` for that key alone;
+everything already applied stays `NOOP`.
 
 The comparison is against what Telegram currently holds, not against anything
 remembered locally: rename a topic by hand in the Telegram app and the next
 plan offers to put the configured title back.
+
+Removing a topic from the configuration currently plans nothing at all — see
+[Planner actions](#planner-actions).
 
 ### Concurrency
 
@@ -292,6 +406,14 @@ and a second forum is a config change rather than a format change.
 `DELETE` is declared in the action union and handled explicitly in the
 executor, where it refuses to run, so adding it is a contained change.
 
+A forum `UPDATE` names the single attribute it changes (`title` or
+`description`), because each one is a different Telegram method. A topic or
+message `UPDATE` has only one attribute to change.
+
+`general-topic` only ever produces `NOOP` or `UPDATE`. Telegram made that
+topic when it made the forum, so there is nothing to create, and the union
+carries no `CREATE` for it.
+
 A resource dropped from the desired state is **not** planned for deletion, and
 a chat the state does not record as managed is never looked at — not even one
 that happens to carry the configured title. Destructive reconciliation
@@ -303,14 +425,24 @@ that happens to carry the configured title. Destructive reconciliation
 | --- | --- |
 | inspection | `client.getDialogs()` (read-only) |
 | resolve a recorded forum + its title | `client.getDialogs()` (read-only) |
+| its current description | `channels.getFullChannel` (read-only, only for the forum that matched) |
+| is the built-in General topic hidden | `messages.getForumTopicsByID` on topic `1` (read-only) |
 | do these topics exist, and their titles | `messages.getForumTopicsByID` (read-only) |
 | do these messages exist, and their text | `channels.getMessages` (read-only) |
-| create forum | `channels.createChannel` with `megagroup: true, forum: true` |
+| create forum | `channels.createChannel` with `megagroup: true, forum: true` and `about` |
 | create topic | `messages.createForumTopic` |
 | send message | `messages.sendMessage` |
 | rename forum | `channels.editTitle` |
+| rewrite the forum description | `messages.editChatAbout` |
 | rename topic | `messages.editForumTopic` |
+| hide/show the built-in General topic | `messages.editForumTopic` with `hidden` on topic `1` |
 | edit message | `messages.editMessage` |
+
+The description goes out with `channels.createChannel` rather than as a
+follow-up edit, so a freshly created group never sits there with the wrong
+"about" text because a second request failed. There is no `channels.editAbout`
+in the schema: editing one afterwards is `messages.editChatAbout`, which takes
+a `peer`, not a `channel`.
 
 #### InputPeer vs. InputChannel
 
@@ -362,6 +494,46 @@ calls `sendMessageToTopic(forum, topicId, text)`.
   could not be saved, zero Telegram mutations are attempted: a forum created
   against a read-only checkout would exist with nothing owning it, and the
   next run would build a second one.
+- **The configuration is validated before the first mutating call.** The
+  planner runs `validateDesiredState` up front, so a configuration Telegram
+  would refuse is not applied *partially*: duplicate or empty keys, blank
+  titles and message bodies, and anything past Telegram's length limits stop
+  the run before a single resource is created.
+
+  The measure is **not the same for every field**, so each carries its own
+  rather than sharing one counter:
+
+  | Value | Limit | Measured in |
+  | --- | --- | --- |
+  | forum title | 128 | UTF-8 bytes |
+  | topic title | 128 | UTF-8 bytes |
+  | forum description | 255 | characters |
+  | managed message | 4096 | characters |
+
+  **Titles** are checked in UTF-8 bytes. The MTProto method pages state the
+  constraint on `messages.createForumTopic` / `messages.editForumTopic` as
+  "maximum UTF-8 length: 128", while TDLib counts the same limit in Unicode
+  characters (`MAX_FORUM_TOPIC_TITLE_LENGTH = 128`, applied through
+  `clean_name` → `utf8_truncate`, "truncates UTF-8 string to the given length
+  in Unicode characters"). The two readings differ for non-ASCII text, and
+  bytes are the stricter, so a title that passes here passes under either.
+
+  **The description** is checked in characters: TDLib documents
+  `setChatDescription` as "0-255 characters" and truncates it by character.
+  Counting its bytes instead would cut a Ukrainian description to roughly half
+  the text Telegram accepts — this repository's own description is 182
+  characters but 326 bytes.
+
+  **Message text** is checked in characters, which is not in dispute: the
+  limit is the `message_text_length_max` config value (4096) and TDLib checks
+  it with `utf8_length`, "length of UTF-8 string in characters".
+
+  None of them is JavaScript's `String.length`, which counts UTF-16 units and
+  weighs a non-BMP emoji twice. Exactly at the limit passes; one unit over
+  does not. The error names the offending value by its logical path and the
+  measure it was counted in (`The text of message "tsc8042/rules/intro" is
+  4097 characters, over Telegram's limit of 4096 characters`), so it is
+  searchable and actionable in a long configuration.
 - **Unknown flags are rejected** with exit code 2. A typo like `--yse` is an
   error, never a silent fall-through to the default. `telegram:plan` rejects
   `--yes` outright: it has nothing to confirm.
@@ -454,12 +626,44 @@ app does not own is left alone), atomic replacement and survival of a failed wri
 the preflight that stops a login when the session could not be stored, the
 malformed-session fallback, read failures being fatal, and configuration validation.
 
+The engine tests run against a small neutral fixture, not against the real
+community configuration, so rewording a paragraph of Ukrainian copy cannot
+break a test about action ordering. `test/desired-state.test.ts` covers the
+shipped configuration itself: unique topic keys, keys that are lowercase ASCII
+slugs carrying no emoji or display wording, non-empty and distinct titles,
+exactly one `intro` per topic with unique message keys, text that is non-empty,
+Ukrainian and inside Telegram's 4096-character limit, and no leftover of the
+old test forum. `test/reconcile.test.ts` then drives the real configuration end
+to end: 29 creates plus hiding the built-in General topic, convergence on the
+second run, a reworded title, description and intro reconciling as four
+in-place `UPDATE`s that move no id, and a description-only change sending
+nothing but `setForumDescription`.
+
+The built-in General topic has its own block: hidden on the first apply
+alongside the managed topics, `NOOP` on an unchanged second plan, hidden again
+after someone unhides it by hand, shown again when the configuration asks for
+it, id `1` never appearing in the mapping, never mixed into the recorded-topic
+existence check, no state written for it, and a compile-time assertion that no
+`CREATE` action can carry that resource at all, and a test that closing
+General server-side — which is what Telegram does when it is hidden — is not
+read back as a divergence, so the plan still converges.
+
+Length validation is covered at the boundary: exactly at the limit and one
+unit over, for each of the four limits, in the measure that limit is counted
+in. Cyrillic and non-BMP emoji have their own cases, since the three counts
+diverge there — `"я"` is 2 bytes and 1 character, `"👮"` is 4 bytes, 1
+character and 2 UTF-16 units. Those pin the semantics: 64 Cyrillic characters
+fit a 128-byte topic title and 65 do not; 255 Cyrillic characters fit the
+description although they are 510 bytes; and 128 emoji in a title are now
+rejected at 512 UTF-8 bytes, which the earlier character-only counter let
+through.
+
 For reconciliation they also cover: a first run planning three creates; a second
 run against the applied state planning zero mutations, repeatedly and with no
-duplicate group, topic or message; a changed forum title, topic title and
-message text each planning exactly one `UPDATE` and zero `CREATE`, editing the
-existing id, leaving every id unchanged and converging to all-`NOOP`
-afterwards; a stale topic mapping and a stale message mapping each being
+duplicate group, topic or message; a changed forum title, forum description,
+topic title and message text each planning exactly one `UPDATE` and zero
+`CREATE`, editing the existing id, leaving every id unchanged and converging to
+all-`NOOP` afterwards; a stale topic mapping and a stale message mapping each being
 detected and recreated; a deleted forum putting the whole tree back; unmanaged
 chats being ignored even when one carries the configured title; `plan` mutating
 nothing, writing no state and taking no lock; a refused confirmation mutating
